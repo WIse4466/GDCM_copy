@@ -226,7 +226,7 @@ class GuidedDiverseConceptMiner(nn.Module):
         if self.is_multiclass:
             self.num_classes = max(len(np.unique(y_train)),len(np.unique(y_test))) #如為多類別，則計算y_train和y_test中唯一標籤的最大數量
         
-        
+
         
         
         
@@ -337,3 +337,419 @@ class GuidedDiverseConceptMiner(nn.Module):
         self.multinomial = AliasMultinomial(wf, self.device)
 
     """ code optimization task 1 (for checking if y_train/y_test is binary or continuous in the existing datasets)"""
+
+def check_binary_labels(self, y):
+    unique_values = np.unique(y)
+    
+    return (len(unique_values) == 2 and set(unique_values).issubset({0, 1}))
+
+
+def check_multiclass_labels(self, y):
+    unique_values = np.unique(y)
+    num_of_vals = len(unique_values)
+    return num_of_vals > 2 and not np.issubdtype(y.dtype, np.number)
+
+
+def validate_labels(self):
+    if self.check_binary_labels(self.y_train):
+        print("y_train is binary")
+    else:
+        print("y_train is continuous, normalizing y_train...")
+    if self.check_binary_labels(self.y_test):
+        print("y_test is binary")
+    else:
+        print("y_test is continuous, normalizing y_test...")
+
+def normalize_labels(self, data, method='standard'):
+    if method == 'standard':
+        scaler = StandardScaler()
+    elif method == 'minmax':
+        scaler = MinMaxScaler()
+    elif method == 'robust':
+        scaler = RobustScaler()
+    else:
+        raise ValueError("Unsupported normalization method")
+    
+    return scaler.fit_transform(data.reshape(-1, 1)).flatten()
+
+
+
+
+def forward(self, doc, target, contexts, labels, per_doc_loss=None):
+    """
+    Args:
+        doc:        [batch_size,1] LongTensor of document indices
+        target:     [batch_size,1] LongTensor of target (pivot) word indices
+        contexts:   [batchsize,window_size] LongTensor of convext word indices
+        labels:     [batchsize,1] LongTensor of document labels
+
+        All arguments are tensors wrapped in Variables.
+    """
+    batch_size, window_size = contexts.size()
+
+    # reweight loss by document length
+    w = autograd.Variable(self.docweights[doc.data]).to(self.device)
+    w /= w.sum()
+    w *= w.size(0)
+
+    # construct document vector = weighted linear combination of concept vectors
+    if self.inductive:
+        doc_concept_weights = self.doc_concept_network(self.bow_train[doc])
+    else:
+        doc_concept_weights = self.doc_concept_weights(doc)
+    doc_concept_probs = F.softmax(doc_concept_weights, dim=1)
+    doc_concept_probs = doc_concept_probs.unsqueeze(1)  # (batches, 1, T)
+    concept_embeddings = self.embedding_t.expand(batch_size, -1, -1)  # (batches, T, E)
+    doc_vector = torch.bmm(doc_concept_probs, concept_embeddings)  # (batches, 1, E)
+    doc_vector = doc_vector.squeeze(dim=1)  # (batches, E)
+    doc_vector = self.dropout2(doc_vector)
+
+    # sample negative word indices for negative sampling loss; approximation by sampling from the whole vocab
+    if self.device == "cpu":
+        nwords = torch.multinomial(self.weights, batch_size * window_size * self.nnegs,
+                                    replacement=True).view(batch_size, -1)
+        nwords = autograd.Variable(nwords)
+    else:
+        nwords = self.multinomial.draw(batch_size * window_size * self.nnegs)
+        nwords = autograd.Variable(nwords).view(batch_size, window_size * self.nnegs)
+
+    # compute word vectors
+    ivectors = self.dropout1(self.embedding_i(target))  # (batches, E)
+    ovectors = self.embedding_i(contexts)  # (batches, window_size, E)
+    nvectors = self.embedding_i(nwords).neg()  # row vector
+
+    # construct "context" vector defined by lda2vec
+    context_vectors = doc_vector + ivectors
+    context_vectors = context_vectors.unsqueeze(2)  # (batches, E, 1)
+
+    # compose negative sampling loss
+    oloss = torch.bmm(ovectors, context_vectors).squeeze(dim=2).sigmoid().clamp(min=consts.EPS).log().sum(1)
+    nloss = torch.bmm(nvectors, context_vectors).squeeze(dim=2).sigmoid().clamp(min=consts.EPS).log().sum(1)
+    negative_sampling_loss = (oloss + nloss).neg()
+    negative_sampling_loss *= w  # downweight loss for each document
+    negative_sampling_loss = negative_sampling_loss.mean()  # mean over the batch
+
+    # compose dirichlet loss
+    doc_concept_probs = doc_concept_probs.squeeze(dim=1)  # (batches, T)
+    doc_concept_probs = doc_concept_probs.clamp(min=consts.EPS)
+    dirichlet_loss = doc_concept_probs.log().sum(1)  # (batches, 1)
+    dirichlet_loss *= self.lam * (1.0 - self.alpha)
+    dirichlet_loss *= w  # downweight loss for each document
+    dirichlet_loss = dirichlet_loss.mean()  # mean over the entire batch
+
+    ones = torch.ones((batch_size, 1)).to(self.device)
+    doc_concept_probs = torch.cat((ones, doc_concept_probs), dim=1)
+
+    # expand doc_concept_probs vector with explanatory variables
+    if self.expvars_train is not None:
+        doc_concept_probs = torch.cat((doc_concept_probs, self.expvars_train[doc, :]),
+                                        dim=1)
+    # compose prediction loss
+    # [batch_size] = torch.matmul([batch_size, nconcepts], [nconcepts])
+    # pred_weight = torch.matmul(doc_concept_probs.unsqueeze(0), self.theta).squeeze(0)
+    # print(doc_concept_probs.shape)
+    # print(self.theta.shape)
+    pred_weight = torch.matmul(doc_concept_probs, self.theta)
+    # print(pred_weight)
+    # print(labels)
+
+    if self.is_binary:
+        pred_loss = F.binary_cross_entropy_with_logits(pred_weight, labels,
+                                                    weight=w, reduction='none')
+    elif self.is_multiclass:
+        pred_loss = F.cross_entropy(pred_weight, labels.long(), reduction = 'none')
+    else:
+        pred_loss = F.mse_loss(pred_weight, labels, reduction='none')
+        pred_loss = pred_loss * w # applying the weight element-wise to the calcuated loss
+
+    pred_loss *= self.rho
+    pred_loss = pred_loss.mean()
+
+    # compose diversity loss
+    #   1. First compute \sum_i \sum_j log(sigmoid(T_i, T_j))
+    #   2. Then compute \sum_i log(sigmoid(T_i, T_i))
+    #   3. Loss = (\sum_i \sum_j log(sigmoid(T_i, T_j)) - \sum_i log(sigmoid(T_i, T_i)) )
+    #           = \sum_i \sum_{j > i} log(sigmoid(T_i, T_j))
+    div_loss = torch.mm(self.embedding_t,
+                        torch.t(self.embedding_t)).sigmoid().clamp(min=consts.EPS).log().sum() \
+                - (self.embedding_t * self.embedding_t).sigmoid().clamp(min=consts.EPS).log().sum()
+    div_loss /= 2.0  # taking care of duplicate pairs T_i, T_j and T_j, T_i
+    div_loss = div_loss.repeat(batch_size)
+    div_loss *= w  # downweight by document lengths
+    div_loss *= self.eta
+    div_loss = div_loss.mean()  # mean over the entire batch
+
+    return negative_sampling_loss, dirichlet_loss, pred_loss, div_loss
+
+def fit(self, lr=0.01, nepochs=200, pred_only_epochs=20,
+        batch_size=100, weight_decay=0.01, grad_clip=5, save_epochs=10, concept_dist="dot"):
+    """
+    Train the GDCM model
+
+    Parameters
+    ----------
+    lr : float
+        Learning rate
+    nepochs : int
+        The number of training epochs
+    pred_only_epochs : int
+        The number of epochs optimized with prediction loss only
+    batch_size : int
+        Batch size
+    weight_decay : float
+        Adam optimizer weight decay (L2 penalty)
+    grad_clip : float
+        Maximum gradients magnitude. Gradients will be clipped within the range [-grad_clip, grad_clip]
+    save_epochs : int
+        The number of epochs in between saving the model weights
+    concept_dist: str
+        Concept vectors distance metric. Choices are 'dot', 'correlation', 'cosine', 'euclidean', 'hamming'.
+
+    Returns
+    -------
+    metrics : ndarray, shape (n_epochs, 6)
+        Training metrics from each epoch including: total_loss, avg_sgns_loss, avg_diversity_loss, avg_pred_loss,
+        avg_diversity_loss, train_auc, test_auc
+    """
+    train_dataloader = torch.utils.data.DataLoader(self.train_dataset, batch_size, shuffle=True,
+                                                    num_workers=4, pin_memory=True,
+                                                    drop_last=False)
+
+    
+    
+    self.to(self.device)
+
+    train_metrics_file = open(os.path.join(self.out_dir, "train_metrics.txt"), "w")
+    train_metrics_file.write("total_loss,avg_sgns_loss,avg_dirichlet_loss,avg_pred_loss,"
+                                "avg_div_loss,train_auc,test_auc\n")
+
+    # SGD generalizes better: https://arxiv.org/abs/1705.08292
+    optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
+    nwindows = len(self.train_dataset)
+    results = []
+    for epoch in range(nepochs):
+        total_sgns_loss = 0.0
+        total_dirichlet_loss = 0.0
+        total_pred_loss = 0.0
+        total_diversity_loss = 0.0
+
+        self.train()
+        for batch in train_dataloader:
+            batch = batch.long()
+            batch = batch.to(self.device)
+            doc = batch[:, 0]
+            iword = batch[:, 1]
+            owords = batch[:, 2:-1]
+            labels = batch[:, -1].float()
+
+            sgns_loss, dirichlet_loss, pred_loss, div_loss = self(doc, iword, owords, labels)
+            if epoch < pred_only_epochs:
+                loss = pred_loss
+            else:
+                loss = sgns_loss + dirichlet_loss + pred_loss + div_loss
+            optimizer.zero_grad()
+            loss.backward()
+
+            # gradient clipping
+            for p in self.parameters():
+                if p.requires_grad and p.grad is not None:
+                    p.grad = p.grad.clamp(min=-grad_clip, max=grad_clip)
+
+            optimizer.step()
+
+            nsamples = batch.size(0)
+
+            total_sgns_loss += sgns_loss.detach().cpu().numpy() * nsamples
+            total_dirichlet_loss += dirichlet_loss.detach().cpu().numpy() * nsamples
+            total_pred_loss += pred_loss.data.detach().cpu().numpy() * nsamples
+            total_diversity_loss += div_loss.data.detach().cpu().numpy() * nsamples
+
+        train_auc = self.calculate_auc("Train", self.bow_train, self.y_train, self.expvars_train)
+        test_auc = 0.0
+        if self.inductive:
+            test_auc = self.calculate_auc("Test", self.bow_test, self.y_test, self.expvars_test)
+
+        total_loss = (total_sgns_loss + total_dirichlet_loss + total_pred_loss + total_diversity_loss) / nwindows
+        avg_sgns_loss = total_sgns_loss / nwindows
+        avg_dirichlet_loss = total_dirichlet_loss / nwindows
+        avg_pred_loss = total_pred_loss / nwindows
+        avg_diversity_loss = total_diversity_loss / nwindows
+        self.logger.info("epoch %d/%d:" % (epoch, nepochs))
+        self.logger.info("Total loss: %.4f" % total_loss)
+        self.logger.info("SGNS loss: %.4f" % avg_sgns_loss)
+        self.logger.info("Dirichlet loss: %.4f" % avg_dirichlet_loss)
+        self.logger.info("Prediction loss: %.4f" % avg_pred_loss)
+        self.logger.info("Diversity loss: %.4f" % avg_diversity_loss)
+        concepts = self.get_concept_words(concept_dist=concept_dist)
+        with open(os.path.join(self.concept_dir, "epoch%d.txt" % epoch), "w") as concept_file:
+            for i, concept_words in enumerate(concepts):
+                self.logger.info('concept %d: %s' % (i + 1, ' '.join(concept_words)))
+                concept_file.write('concept %d: %s\n' % (i + 1, ' '.join(concept_words)))
+        metrics = (total_loss, avg_sgns_loss, avg_dirichlet_loss, avg_pred_loss,
+                    avg_diversity_loss, train_auc, test_auc)
+        train_metrics_file.write("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % metrics)
+        train_metrics_file.flush()
+        results.append(metrics)
+        if (epoch + 1) % save_epochs == 0:
+            torch.save(self.state_dict(), os.path.join(self.model_dir, "epoch%d.pytorch" % epoch))
+            with torch.no_grad():
+                doc_concept_probs = self.get_train_doc_concept_probs()
+                np.save(os.path.join(self.model_dir, "epoch%d_train_doc_concept_probs.npy" % epoch),
+                        doc_concept_probs.cpu().detach().numpy())
+
+    torch.save(self.state_dict(), os.path.join(self.model_dir, "epoch%d.pytorch" % (nepochs - 1)))
+    return np.array(results)
+
+def calculate_auc(self, split, X, y, expvars):
+    y_pred = self.predict_proba(X, expvars).cpu().detach().numpy()
+    if self.is_binary:
+        auc = roc_auc_score(y, y_pred)
+        self.logger.info("%s AUC: %.4f" % (split, auc))
+        return auc
+    elif self.is_multiclass:
+        y = np.asarray(y).astype(int)
+    
+        num_classes = len(np.unique(y))
+        
+        if num_classes > 1:  
+            
+            y_pred_normalized = y_pred / y_pred.sum(axis=1, keepdims=True)
+            auc = roc_auc_score(y, y_pred_normalized, multi_class='ovr')
+            self.logger.info("%s AUC (OvR): %.4f" % (split, auc))
+            return auc
+        else:
+            #in case only one class is present
+            self.logger.warning("Only one class present in true labels. ROC AUC score is not defined in that case.")
+            return None  
+    else:
+        mse = mean_squared_error(y, y_pred)
+        # mae = mean_absolute_error(y, y_pred)
+        # r2 = r2_score(y, y_pred)
+        self.logger.info("%s MSE: %.4f" % (split, mse))
+        return mse
+        
+
+def predict_proba(self, count_matrix, expvars=None):
+    with torch.no_grad():
+        batch_size = count_matrix.size(0)
+        if self.inductive:
+            doc_concept_weights = self.doc_concept_network(count_matrix)
+        else:
+            doc_concept_weights = self.doc_concept_weights.weight.data
+        doc_concept_probs = F.softmax(doc_concept_weights, dim=1)  # convert to probabilities
+        ones = torch.ones((batch_size, 1)).to(self.device)
+        doc_concept_probs = torch.cat((ones, doc_concept_probs), dim=1)
+
+        if expvars is not None:
+            doc_concept_probs = torch.cat((doc_concept_probs, expvars), dim=1)
+
+        pred_weight = torch.matmul(doc_concept_probs, self.theta)
+        pred_proba = pred_weight.sigmoid()
+    return pred_proba
+
+def get_train_doc_concept_probs(self):
+    if self.inductive:
+        doc_concept_weights = self.doc_concept_network(self.bow_train)
+    else:
+        doc_concept_weights = self.doc_concept_weights.weight.data
+    return F.softmax(doc_concept_weights, dim=1)  # convert to probabilities
+
+def visualize(self):
+    with torch.no_grad():
+        doc_concept_probs = self.get_train_doc_concept_probs()
+        # [n_concepts, vocab_size] weighted word counts of each concept
+        concept_word_counts = torch.matmul(doc_concept_probs.transpose(0, 1), self.bow_train)
+        # normalize word counts to word distribution of each concept
+        concept_word_dists = concept_word_counts / concept_word_counts.sum(1, True)
+        # fill NaN with 1/vocab_size in case a concept has all zero word distribution
+        concept_word_dists[concept_word_dists != concept_word_dists] = 1.0 / concept_word_dists.shape[1]
+        vis_data = pyLDAvis.prepare(topic_term_dists=concept_word_dists.data.cpu().numpy(),
+                                    doc_topic_dists=doc_concept_probs.data.cpu().numpy(),
+                                    doc_lengths=self.doc_lens, vocab=self.vocab, term_frequency=self.word_counts)
+        
+        html_path = os.path.join(self.out_dir, "visualization.html")
+        pyLDAvis.save_html(vis_data, html_path)
+        # pyLDAvis.save_html(vis_data, os.path.join(self.out_dir, "visualization.html"))
+
+        for i in range(len(concept_word_dists)):
+            concept_word_weights = dict(zip(self.vocab, concept_word_dists[i].cpu().numpy()))
+            wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(concept_word_weights)
+            plt.figure(figsize=(10, 5))
+            plt.imshow(wordcloud, interpolation='bilinear')
+            plt.title(f'Concept {i+1} Word Cloud')
+            plt.axis('off')
+            plt.savefig(os.path.join(self.out_dir, f'concept_{i+1}_wordcloud.png'))
+
+        with open(html_path, "a+") as f:
+
+            current_directory = os.getcwd()
+            print("Current directory:", current_directory)
+            swiper_vis_path = current_directory + '/swiper.html'
+            with open(swiper_vis_path, 'r') as swipertext:
+                swiper = swipertext.read() 
+                
+            f.write(swiper)
+        
+
+# TODO: add filtering such as pos and tf
+def get_concept_words(self, top_k=10, concept_dist='dot'):
+    concept_embed = self.embedding_t.data.cpu().numpy()
+    word_embed = self.embedding_i.weight.data.cpu().numpy()
+    if concept_dist == 'dot':
+        dist = -np.matmul(concept_embed, np.transpose(word_embed, (1, 0)))
+    else:
+        dist = cdist(concept_embed, word_embed, metric=concept_dist)
+    nearest_word_idxs = np.argsort(dist, axis=1)[:, :top_k]  # indices of words with min cosine distance
+    concepts = []
+    for j in range(self.nconcepts):
+        nearest_words = [self.vocab[i] for i in nearest_word_idxs[j, :]]
+        concepts.append(nearest_words)
+    return concepts
+
+
+class DocWindowsDataset(torch.utils.data.Dataset):
+    def __init__(self, windows):
+        self.data = windows
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+"""
+此類別繼承自PyTorch的torch.utils.data.Dataset
+提供了一個有效的介面來有效地處理和操作上下文視窗(或滑動視窗)資料，通常用於訓練或測試機器學習模型。
+1. 目的
+此類別封裝了一個由 windows 表示的資料集，其中每個「視窗」都是一列結構化的數據（例如包含文件索引、目標詞、上下文詞和標籤等）。這種視窗化的資料通常應用於自然語言處理（NLP）相關任務，例如從語料庫中生成上下文視窗，用於訓練或測試模型。
+
+透過 PyTorch 的 Dataset API，這類數據可以高效地載入和處理，尤其是在搭配 DataLoader 時。
+
+2. 建構函式：__init__
+參數：
+windows：類似陣列的物件（例如 numpy.ndarray 或 torch.Tensor），包含上下文視窗的資料集。
+功能：
+將輸入的 windows 儲存到實例變數 self.data 中，作為資料集的內部表示。
+
+3. 長度：__len__
+回傳值：
+資料集中項目的數量（行數），即上下文視窗的總數。
+功能：
+支援與 PyTorch 的 DataLoader 相容，DataLoader 會使用此方法來決定要生成多少批次（batches）。
+
+4. 取項目：__getitem__
+參數：
+idx：一個整數索引，指定要檢索的數據項目。
+回傳值：
+self.data 中第 idx 行的資料，表示單一的上下文視窗。
+功能：
+提供一種方法，透過索引訪問資料集中的單一項目，這對於訓練或推論時的批次處理非常重要。
+
+為何使用這個類別？
+自訂的 PyTorch 資料集：
+繼承自 torch.utils.data.Dataset，確保與 PyTorch 的 DataLoader 相容，可自動化批次載入、隨機打亂和多線程處理。
+處理上下文視窗：
+此資料集專為儲存和檢索上下文視窗而設計，常見於 Word2Vec、主題建模或其他 NLP 任務。
+可擴展性：
+透過實作 __len__ 和 __getitem__ 方法，使此資料集能夠高效處理大規模數據。
+
+"""
