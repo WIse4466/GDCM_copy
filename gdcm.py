@@ -231,16 +231,20 @@ class GuidedDiverseConceptMiner(nn.Module):
         
         
         
-        self.train_dataset = DocWindowsDataset(doc_windows)
+        self.train_dataset = DocWindowsDataset(doc_windows) #把有關上下文的資料丟入，建立一個DocWindowsDataset的物件
 
-        if doc_lens is None:
-            self.docweights = np.ones(ndocs, dtype=np.float)
+        if doc_lens is None: #doc_lens : 每個文件的長度(詞彙數量)，形狀為(n_train_docs,)。
+            self.docweights = np.ones(ndocs, dtype=np.float) #ndocs : 文件的總數，即bow_train.shape[0]。 self.docweights : 儲存計算出的文件權重，後續可能用於調整損失函數或模型訓練權重。
         else:
             self.docweights = 1.0 / np.log(doc_lens)
             self.doc_lens = doc_lens
         self.docweights = torch.tensor(self.docweights, dtype=torch.float32, requires_grad=False, device=device)
+        """檢查doc_lens是否為空，如果為空(沒有提供文件長度資訊)，將docweights全設定為1的陣列，不考慮文件長度的影響。
+           有提供doc_lens的話，計算文件的權重，較長文件權重低，較短文件權重高，類似TF-IDF的標準化技術
+           最後轉為PyTorch的張量(tensor)，以便使用GPU加速運算和PyTorch模型相容。
+           requires_grad=False：表示這個張量不需要梯度更新，通常用於靜態權重或參數。"""
 
-        if expvars_train is not None:
+        if expvars_train is not None: #如果有額外的變數，把其也轉成PyTorch張量
             self.expvars_train = torch.tensor(expvars_train, dtype=torch.float32, requires_grad=False, device=device)
         if expvars_test is not None:
             self.expvars_test = torch.tensor(expvars_test, dtype=torch.float32, requires_grad=False, device=device)
@@ -248,13 +252,33 @@ class GuidedDiverseConceptMiner(nn.Module):
         self.embedding_i = nn.Embedding(num_embeddings=vocab_size,
                                         embedding_dim=embed_dim,
                                         sparse=False)
+        '''nn.Embedding 是 PyTorch 提供的嵌入層，可以將離散的單詞索引（如詞彙 ID）轉換為連續的向量（詞向量）。
+           num_embeddings=vocab_size：詞彙表大小（vocab_size），也就是模型能夠學習的不同詞的數量。
+           embedding_dim=embed_dim：詞向量的維度，通常設為 100、200 或 300（根據應用場景）。
+           sparse=False：
+             是否使用稀疏梯度更新：
+               True：適用於大詞彙表，節省內存，但僅適用於 SGD 優化器。
+               False：適用於大部分優化器（如 Adam），會更新所有權重。'''
         if word_vectors is not None:
-            self.embedding_i.weight.data = torch.FloatTensor(word_vectors)
+            self.embedding_i.weight.data = torch.FloatTensor(word_vectors) #如果有預先訓練好的詞向量 (word_vectors)，則直接將其賦值給嵌入層的權重 (self.embedding_i.weight.data)。
         else:
-            torch.nn.init.kaiming_normal_(self.embedding_i.weight)
+            torch.nn.init.kaiming_normal_(self.embedding_i.weight) #如果沒有提供預先訓練的詞向量，則使用 Kaiming 正規初始化 (kaiming_normal_) 來初始化詞向量的權重
 
         # regular embedding for concepts (never indexed so not sparse)
         self.embedding_t = nn.Parameter(torch.FloatTensor(ortho_group.rvs(embed_dim)[0:nconcepts]))
+        '''
+            self.embedding_t：這是用來表示「概念」的嵌入向量 (concept embeddings)。
+            nn.Parameter(...)：
+            讓這個變數成為可學習參數，它會在訓練過程中自動更新。
+            這與 nn.Embedding 不同，因為 nn.Embedding 是用來查找離散索引，而這裡是直接定義一組可學習的概念向量。
+            ortho_group.rvs(embed_dim)[0:nconcepts]：
+            這個函數來自 scipy.stats，用來生成隨機正交矩陣（Orthogonal Matrix）。
+            正交矩陣 可以確保概念向量之間的距離盡可能均勻分佈，減少相關性 (避免過度擬合)。
+            rvs(embed_dim) 生成一個 embed_dim × embed_dim 的矩陣，我們取前 nconcepts 行來初始化概念向量。
+            為什麼使用正交矩陣來初始化？
+            確保概念向量之間的多樣性，避免過度相似。
+            提升數值穩定性，防止梯度消失或梯度爆炸。
+            促進學習不同的語意概念，適合主題建模 (Topic Modeling) 或語意分析任務。'''
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
         if file_log:
@@ -265,6 +289,11 @@ class GuidedDiverseConceptMiner(nn.Module):
         else:
             logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.DEBUG)
         self.logger = logging.getLogger(__name__)
+        '''
+            刪除舊的日誌處理器，避免重複輸出。
+            支援將日誌寫入檔案或輸出到終端，方便後續調試。
+            設定日誌格式，讓輸出更具可讀性。
+            建立 self.logger 物件，後續可以用 self.logger.debug(...) 來記錄資訊。'''
 
         # embedding for per-document concept weights
         if self.inductive:
