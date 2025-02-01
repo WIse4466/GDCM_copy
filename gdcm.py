@@ -296,8 +296,12 @@ class GuidedDiverseConceptMiner(nn.Module):
             建立 self.logger 物件，後續可以用 self.logger.debug(...) 來記錄資訊。'''
 
         # embedding for per-document concept weights
+        '''
+        如果self.inductive==True，則模型不直接儲存概念權重。
+        使用神經網路，由BOW向量產生概念權重。
+        Appendix A.3'''
         if self.inductive:
-            weight_generator_network = []
+            weight_generator_network = [] #用來存放神經網路各層(linear, tanh, dropout)的list
             if num_layers > 0:
                 # input layer
                 weight_generator_network.extend([torch.nn.Linear(vocab_size, hidden_size),
