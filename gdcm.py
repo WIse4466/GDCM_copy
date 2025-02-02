@@ -369,26 +369,38 @@ class GuidedDiverseConceptMiner(nn.Module):
         wf = wf / np.sum(wf)  # convert to probabilities
         self.weights = torch.tensor(wf, dtype=torch.float32, requires_grad=False, device=device)
         self.vocab = vocab
+        '''
+        這部分與 Word2Vec 的負樣本抽樣方法類似。
+        word_counts：單詞出現的次數。
+        consts.BETA：控制對高頻單詞的懲罰 (常見值為 0.75)。
+        這個公式讓常見的單詞被降低權重，而較罕見的單詞增加機率。
+        最後轉成 torch.tensor，並設置 requires_grad=False，確保它不會被訓練更新。'''
         # dropout
         self.dropout1 = nn.Dropout(consts.PIVOTS_DROPOUT)
         self.dropout2 = nn.Dropout(consts.DOC_VECS_DROPOUT)
+        '''self.dropout1 和 self.dropout2 負責在不同的部分隨機丟棄神經元，以防止過擬合：
+                consts.PIVOTS_DROPOUT：用於樞軸詞 (pivot words)。
+                consts.DOC_VECS_DROPOUT：用於文件向量 (document vectors)。'''
         self.multinomial = AliasMultinomial(wf, self.device)
+        '''AliasMultinomial 是一種高效的 非均勻隨機抽樣方法。
+        這裡使用 wf (負樣本權重) 來進行 負樣本抽樣 (Negative Sampling)，類似於 Word2Vec 的技巧。
+        '''
 
     """ code optimization task 1 (for checking if y_train/y_test is binary or continuous in the existing datasets)"""
 
-def check_binary_labels(self, y):
+def check_binary_labels(self, y): #檢查y是否為二元標籤
     unique_values = np.unique(y)
     
     return (len(unique_values) == 2 and set(unique_values).issubset({0, 1}))
 
 
-def check_multiclass_labels(self, y):
+def check_multiclass_labels(self, y): #檢查y使否為多類別，且不是數值資料。ex : ['cat', 'dog', 'fish']
     unique_values = np.unique(y)
     num_of_vals = len(unique_values)
     return num_of_vals > 2 and not np.issubdtype(y.dtype, np.number)
 
 
-def validate_labels(self):
+def validate_labels(self): #驗證y_train和y_test是否為二元分類
     if self.check_binary_labels(self.y_train):
         print("y_train is binary")
     else:
@@ -398,17 +410,17 @@ def validate_labels(self):
     else:
         print("y_test is continuous, normalizing y_test...")
 
-def normalize_labels(self, data, method='standard'):
+def normalize_labels(self, data, method='standard'): #對y_train或y_test進行標準化
     if method == 'standard':
-        scaler = StandardScaler()
+        scaler = StandardScaler() #使用Z-score標準化
     elif method == 'minmax':
-        scaler = MinMaxScaler()
+        scaler = MinMaxScaler() #使用Min-Max標準化
     elif method == 'robust':
-        scaler = RobustScaler()
+        scaler = RobustScaler() #使用Robust標準化
     else:
         raise ValueError("Unsupported normalization method")
     
-    return scaler.fit_transform(data.reshape(-1, 1)).flatten()
+    return scaler.fit_transform(data.reshape(-1, 1)).flatten() #將data轉為2D矩陣，因為scaler.fit_transform()需要2D輸入。使用flatten()轉回1D，以維持原始y的形狀。
 
 
 
