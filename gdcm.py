@@ -304,42 +304,47 @@ class GuidedDiverseConceptMiner(nn.Module):
             weight_generator_network = [] #用來存放神經網路各層(linear, tanh, dropout)的list
             if num_layers > 0:
                 # input layer
-                weight_generator_network.extend([torch.nn.Linear(vocab_size, hidden_size),
-                                                 torch.nn.Tanh(),
-                                                 torch.nn.Dropout(inductive_dropout)])
+                weight_generator_network.extend([torch.nn.Linear(vocab_size, hidden_size), #將BOW向量轉為隱藏層
+                                                 torch.nn.Tanh(), #激活函數，讓數值落在[-1, 1]
+                                                 torch.nn.Dropout(inductive_dropout)]) #隨機丟棄一些神經元，防止overfitting
                 # hidden layers
-                for h in range(num_layers):
+                for h in range(num_layers): #num_layers個隱藏層，每個維度都一樣
                     weight_generator_network.extend([torch.nn.Linear(hidden_size, hidden_size),
                                                      torch.nn.Tanh(),
                                                      torch.nn.Dropout(inductive_dropout)])
                 # output layer
-                weight_generator_network.append(torch.nn.Linear(hidden_size,
+                weight_generator_network.append(torch.nn.Linear(hidden_size, #隱藏層映射到概念的數量
                                                                 nconcepts))
             else:
                 weight_generator_network.append(torch.nn.Linear(vocab_size,
                                                                 nconcepts))
-            for m in weight_generator_network:
+            for m in weight_generator_network: #確保所有Linear層的權重(weight)和偏差(bias)被初始化成服從常態分布，避免梯度消失或爆炸
                 if type(m) == torch.nn.Linear:
                     torch.nn.init.normal_(m.weight)
                     torch.nn.init.normal_(m.bias)
-            self.doc_concept_network = torch.nn.Sequential(*weight_generator_network)
+            self.doc_concept_network = torch.nn.Sequential(*weight_generator_network) #將所有Linear、Tanh和Dropout層組成一個Sequential神經網路
         else:
             self.doc_concept_weights = nn.Embedding(num_embeddings=ndocs,
                                                     embedding_dim=nconcepts,
                                                     sparse=False)
+            '''如果 self.inductive == False，則 直接用 nn.Embedding 來存每個文件的概念權重，不使用神經網路。
+            ndocs：文件數量，每個文件都有一組概念權重。
+            nconcepts：每個文件的概念數量。
+            sparse=False：不啟用稀疏更新，讓梯度能夠更新所有權重。'''
+            
             if doc_concept_probs is not None:
-                self.doc_concept_weights.weight.data = torch.FloatTensor(doc_concept_probs)
+                self.doc_concept_weights.weight.data = torch.FloatTensor(doc_concept_probs) # 如果有預設概念權重，則載入
             else:
-                torch.nn.init.kaiming_normal_(self.doc_concept_weights.weight)
+                torch.nn.init.kaiming_normal_(self.doc_concept_weights.weight) #如果沒有預設權重，則使用 Kaiming 初始化
 
         if theta is not None:
-            self.theta = Parameter(torch.FloatTensor(theta))
-        # explanatory variables
+            self.theta = Parameter(torch.FloatTensor(theta)) #如果 theta 不是 None，則將其轉換成 torch.FloatTensor，並包裝成 nn.Parameter。
+        # explanatory variables 以下作用為初始化theta
         else:
             if expvars_train is not None:
                 # TODO: add assert shape
-                nexpvars = expvars_train.shape[1]
-                if self.is_multiclass:
+                nexpvars = expvars_train.shape[1] #得到可解釋變數的數量
+                if self.is_multiclass: #決定theta的形狀
                     self.theta = Parameter(torch.FloatTensor(nconcepts + nexpvars + 1, self.num_classes))  # + 1 for bias
                 else:
                     self.theta = Parameter(torch.FloatTensor(nconcepts + nexpvars + 1))  # for binary and continuous variables
@@ -351,9 +356,9 @@ class GuidedDiverseConceptMiner(nn.Module):
                 else:
                     self.theta = Parameter(torch.FloatTensor(nconcepts + 1))  # for binary and continuous variables
         
-        torch.nn.init.normal_(self.theta)
+        torch.nn.init.normal_(self.theta) #使用常態分布初始化theta，讓模型在初始時不會有過大的數值，避免梯度爆炸或消失的問題。
 
-        # enable gradients (True by default, just confirming)
+        # enable gradients (True by default, just confirming) 確保embeddinng_i, embedding_t, theta都能參與梯度更新
         self.embedding_i.weight.requires_grad = True
         self.embedding_t.requires_grad = True
         self.theta.requires_grad = True
