@@ -434,25 +434,38 @@ def forward(self, doc, target, contexts, labels, per_doc_loss=None):
         labels:     [batchsize,1] LongTensor of document labels
 
         All arguments are tensors wrapped in Variables.
+
+        此函式的主要用途是計算LDA2Vec的loss function
+        1. 負採樣損失 (Negative Sampling Loss) : 用於詞嵌入學習
+        2. Dirichlet Loss : 用於主題建模 (Topic Modeling)
+        3. 預測損失 (Prediction Loss) : 用於預測labels
+        4. 多樣性損失 (Diversity Loss) : 用於鼓勵不同的概念向量(Concept Vectors)具有較大差異
     """
     batch_size, window_size = contexts.size()
 
     # reweight loss by document length
-    w = autograd.Variable(self.docweights[doc.data]).to(self.device)
-    w /= w.sum()
-    w *= w.size(0)
+    w = autograd.Variable(self.docweights[doc.data]).to(self.device) #將tensor包進Variable中，支援backward()。autograd(自動微分)
+    w /= w.sum() #計算文件的權重
+    w *= w.size(0) #w會依據文檔長度進行標準化，以確保長文檔不會過度影響模型。
 
     # construct document vector = weighted linear combination of concept vectors
     if self.inductive:
-        doc_concept_weights = self.doc_concept_network(self.bow_train[doc])
+        doc_concept_weights = self.doc_concept_network(self.bow_train[doc]) #在CAN計算出來的
     else:
-        doc_concept_weights = self.doc_concept_weights(doc)
+        doc_concept_weights = self.doc_concept_weights(doc) #同樣是CAN
     doc_concept_probs = F.softmax(doc_concept_weights, dim=1)
+    '''
+        文檔向量是由概念向量 (concept vectors) 加權組合而成
+        透過softmax計算主題機率 (doc_concept_probs)，代表每個文檔與不同概念的關聯程度
+    '''
     doc_concept_probs = doc_concept_probs.unsqueeze(1)  # (batches, 1, T)
     concept_embeddings = self.embedding_t.expand(batch_size, -1, -1)  # (batches, T, E)
     doc_vector = torch.bmm(doc_concept_probs, concept_embeddings)  # (batches, 1, E)
     doc_vector = doc_vector.squeeze(dim=1)  # (batches, E)
     doc_vector = self.dropout2(doc_vector)
+    """
+        使用批次矩陣乘法(torch.bmm)，將主題機率(doc_concept_probs)與主題嵌入(concept embeddings)相乘，得到文檔向量(doc_vector)
+    """
 
     # sample negative word indices for negative sampling loss; approximation by sampling from the whole vocab
     if self.device == "cpu":
@@ -462,15 +475,29 @@ def forward(self, doc, target, contexts, labels, per_doc_loss=None):
     else:
         nwords = self.multinomial.draw(batch_size * window_size * self.nnegs)
         nwords = autograd.Variable(nwords).view(batch_size, window_size * self.nnegs)
+    """
+        負採樣透過torch.multinomial從整個詞彙表(vocabulary)中隨機抽取nnegs個詞作為負樣本(negative samples)
+        用來近似word2vec的Skip-gram模型，以提高訓練效率
+    """
 
     # compute word vectors
     ivectors = self.dropout1(self.embedding_i(target))  # (batches, E)
     ovectors = self.embedding_i(contexts)  # (batches, window_size, E)
     nvectors = self.embedding_i(nwords).neg()  # row vector
+    """
+        計算目標詞和負樣本詞向量
+        ivectors : 目標詞向量
+        ovectors : 上下文詞向量
+        nvectors : 負樣本詞向量
+    """
 
     # construct "context" vector defined by lda2vec
     context_vectors = doc_vector + ivectors
     context_vectors = context_vectors.unsqueeze(2)  # (batches, E, 1)
+    """
+        context_vectors = 文檔向量 + 目標詞向量
+        context_vectors表示LDA2Vec定義的語境 (Context Representation)
+    """
 
     # compose negative sampling loss
     oloss = torch.bmm(ovectors, context_vectors).squeeze(dim=2).sigmoid().clamp(min=consts.EPS).log().sum(1)
@@ -478,6 +505,12 @@ def forward(self, doc, target, contexts, labels, per_doc_loss=None):
     negative_sampling_loss = (oloss + nloss).neg()
     negative_sampling_loss *= w  # downweight loss for each document
     negative_sampling_loss = negative_sampling_loss.mean()  # mean over the batch
+    """
+        正樣本損失nloss : 計算ovectors和context_vectors之間的內積，並通過sigmoid運算
+        負樣本損失oloss : 計算nvectors和context_vectors之間的內積
+        最終損失negative_sampling_loss : 兩者相加取負號，然後根據文檔長度w加權
+        公式4
+    """
 
     # compose dirichlet loss
     doc_concept_probs = doc_concept_probs.squeeze(dim=1)  # (batches, T)
@@ -486,6 +519,11 @@ def forward(self, doc, target, contexts, labels, per_doc_loss=None):
     dirichlet_loss *= self.lam * (1.0 - self.alpha)
     dirichlet_loss *= w  # downweight loss for each document
     dirichlet_loss = dirichlet_loss.mean()  # mean over the entire batch
+    """
+        Dirichlet Loss控制主題分布，使的不同文檔的主題權重更加平滑
+        self.lam和self.alpha是正則化超參數
+        公式5
+    """
 
     ones = torch.ones((batch_size, 1)).to(self.device)
     doc_concept_probs = torch.cat((ones, doc_concept_probs), dim=1)
@@ -514,6 +552,13 @@ def forward(self, doc, target, contexts, labels, per_doc_loss=None):
 
     pred_loss *= self.rho
     pred_loss = pred_loss.mean()
+    """
+        計算預測損失 (Prediction Loss)
+        binary_cross_entropy_with_logits適用於二元分類
+        cross_entropy適用於多分類
+        mse_loss適用於回歸
+        公式8
+    """
 
     # compose diversity loss
     #   1. First compute \sum_i \sum_j log(sigmoid(T_i, T_j))
@@ -528,8 +573,14 @@ def forward(self, doc, target, contexts, labels, per_doc_loss=None):
     div_loss *= w  # downweight by document lengths
     div_loss *= self.eta
     div_loss = div_loss.mean()  # mean over the entire batch
+    """
+        計算多樣性損失 (Diversity Loss)
+        確保不同的主題嵌入 (Topic Embeddings) 之間盡可能不相似，避免過度重疊
+        公式6
+    """
 
     return negative_sampling_loss, dirichlet_loss, pred_loss, div_loss
+    #返回4種損失，作為模型學習的目標
 
 def fit(self, lr=0.01, nepochs=200, pred_only_epochs=20,
         batch_size=100, weight_decay=0.01, grad_clip=5, save_epochs=10, concept_dist="dot"):
@@ -539,27 +590,35 @@ def fit(self, lr=0.01, nepochs=200, pred_only_epochs=20,
     Parameters
     ----------
     lr : float
-        Learning rate
+        Learning rate 學習率
     nepochs : int
-        The number of training epochs
+        The number of training epochs 訓練的總epoch數
     pred_only_epochs : int
-        The number of epochs optimized with prediction loss only
+        The number of epochs optimized with prediction loss only 只優化預測損失(prediction loss)的epochs數量
     batch_size : int
-        Batch size
+        Batch size 批次大小
     weight_decay : float
-        Adam optimizer weight decay (L2 penalty)
+        Adam optimizer weight decay (L2 penalty) Adam優化器的L2正則化權重衰減
     grad_clip : float
-        Maximum gradients magnitude. Gradients will be clipped within the range [-grad_clip, grad_clip]
+        Maximum gradients magnitude. Gradients will be clipped within the range [-grad_clip, grad_clip] 梯度裁減的範圍，避免梯度爆炸
     save_epochs : int
-        The number of epochs in between saving the model weights
+        The number of epochs in between saving the model weights 每saved_epochs個epoch儲存一次模型
     concept_dist: str
-        Concept vectors distance metric. Choices are 'dot', 'correlation', 'cosine', 'euclidean', 'hamming'.
+        Concept vectors distance metric. Choices are 'dot', 'correlation', 'cosine', 'euclidean', 'hamming'. 概念向量的距離度量(可選擇dot, correlation, cosine, euclidean, hamming)
 
     Returns
     -------
     metrics : ndarray, shape (n_epochs, 6)
         Training metrics from each epoch including: total_loss, avg_sgns_loss, avg_diversity_loss, avg_pred_loss,
         avg_diversity_loss, train_auc, test_auc
+    -------
+    這個fit方法是GDCM模型的訓練主函式
+    1. 讀取訓練數據並設定Adam優化器
+    2. 進行nepochs次的訓練，每個batch計算SGNS、Dirichlet、預測、多樣性損失
+    3. 根據不同的epoch階段，調整loss function以確保模型逐步收斂
+    4. 使用梯度裁減(grad_clip)防止梯度爆炸
+    5. 計算並記錄AUC，每save_epochs儲存一次模型
+    6. 訓練完成後儲存最終模型並回傳訓練結果
     """
     train_dataloader = torch.utils.data.DataLoader(self.train_dataset, batch_size, shuffle=True,
                                                     num_workers=4, pin_memory=True,
