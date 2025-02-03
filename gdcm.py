@@ -623,7 +623,9 @@ def fit(self, lr=0.01, nepochs=200, pred_only_epochs=20,
     train_dataloader = torch.utils.data.DataLoader(self.train_dataset, batch_size, shuffle=True,
                                                     num_workers=4, pin_memory=True,
                                                     drop_last=False)
-
+    """
+        建立一個train_dataloader，從self.train_dataset讀取訓練數據，並且設置batch size以及是否打亂順序
+    """
     
     
     self.to(self.device)
@@ -633,38 +635,38 @@ def fit(self, lr=0.01, nepochs=200, pred_only_epochs=20,
                                 "avg_div_loss,train_auc,test_auc\n")
 
     # SGD generalizes better: https://arxiv.org/abs/1705.08292
-    optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay) #使用Adam優化器來更新模型的參數，並使用weight_decay來進行L2正則化
     nwindows = len(self.train_dataset)
     results = []
-    for epoch in range(nepochs):
+    for epoch in range(nepochs): #進行nepochs次的訓練
         total_sgns_loss = 0.0
         total_dirichlet_loss = 0.0
         total_pred_loss = 0.0
         total_diversity_loss = 0.0
 
         self.train()
-        for batch in train_dataloader:
-            batch = batch.long()
-            batch = batch.to(self.device)
+        for batch in train_dataloader: #每次從dataloader裡取一個batch
+            batch = batch.long() #確保所有數據轉為long型別
+            batch = batch.to(self.device) #將數據移到GPU
             doc = batch[:, 0]
             iword = batch[:, 1]
             owords = batch[:, 2:-1]
             labels = batch[:, -1].float()
 
-            sgns_loss, dirichlet_loss, pred_loss, div_loss = self(doc, iword, owords, labels)
-            if epoch < pred_only_epochs:
+            sgns_loss, dirichlet_loss, pred_loss, div_loss = self(doc, iword, owords, labels) #代入forward()的方法計算loss
+            if epoch < pred_only_epochs: #在進行次數超過pred_only_epochs後，才加入其他損失
                 loss = pred_loss
             else:
                 loss = sgns_loss + dirichlet_loss + pred_loss + div_loss
             optimizer.zero_grad()
-            loss.backward()
+            loss.backward() #執行反向傳播，並計算梯度
 
-            # gradient clipping
+            # gradient clipping 確保梯度值不會超過grap_clip，避免梯度爆炸
             for p in self.parameters():
                 if p.requires_grad and p.grad is not None:
                     p.grad = p.grad.clamp(min=-grad_clip, max=grad_clip)
 
-            optimizer.step()
+            optimizer.step() #更新模型參數
 
             nsamples = batch.size(0)
 
@@ -673,6 +675,7 @@ def fit(self, lr=0.01, nepochs=200, pred_only_epochs=20,
             total_pred_loss += pred_loss.data.detach().cpu().numpy() * nsamples
             total_diversity_loss += div_loss.data.detach().cpu().numpy() * nsamples
 
+        #Calculate train and test AUC
         train_auc = self.calculate_auc("Train", self.bow_train, self.y_train, self.expvars_train)
         test_auc = 0.0
         if self.inductive:
@@ -699,15 +702,25 @@ def fit(self, lr=0.01, nepochs=200, pred_only_epochs=20,
         train_metrics_file.write("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % metrics)
         train_metrics_file.flush()
         results.append(metrics)
-        if (epoch + 1) % save_epochs == 0:
+        if (epoch + 1) % save_epochs == 0: #每隔save_epochs存檔一次模型的state_dict
             torch.save(self.state_dict(), os.path.join(self.model_dir, "epoch%d.pytorch" % epoch))
             with torch.no_grad():
                 doc_concept_probs = self.get_train_doc_concept_probs()
                 np.save(os.path.join(self.model_dir, "epoch%d_train_doc_concept_probs.npy" % epoch),
                         doc_concept_probs.cpu().detach().numpy())
 
-    torch.save(self.state_dict(), os.path.join(self.model_dir, "epoch%d.pytorch" % (nepochs - 1)))
+    torch.save(self.state_dict(), os.path.join(self.model_dir, "epoch%d.pytorch" % (nepochs - 1))) #儲存最終訓練完成的模型
     return np.array(results)
+    """
+       回傳一個numpy陣列，包含
+       total loss
+       avg_sgns_loss
+       avg_dirichlet_loss
+       avg_predict_loss
+       avg_diversity_loss
+       train_auc
+       test_auc
+    """
 
 def calculate_auc(self, split, X, y, expvars):
     y_pred = self.predict_proba(X, expvars).cpu().detach().numpy()
