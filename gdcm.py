@@ -722,21 +722,31 @@ def fit(self, lr=0.01, nepochs=200, pred_only_epochs=20,
        test_auc
     """
 
-def calculate_auc(self, split, X, y, expvars):
+def calculate_auc(self, split, X, y, expvars): #根據模型種類計算AUC或MSE
+    """
+       split : 指示dataset是train或test
+       x : 特徵矩陣(bag-of-words或其他表示)
+       y : 標籤(真實值)
+       expvars : 額外的變數(在predict_proba中使用)
+    """
     y_pred = self.predict_proba(X, expvars).cpu().detach().numpy()
+    """
+       self.predict_proba(X, expvars)：模型對輸入 X 進行推理，返回預測機率。
+       .cpu().detach().numpy()：將 PyTorch tensor 轉換成 NumPy 陣列，因為 roc_auc_score 需要 NumPy 格式的輸入。
+    """
     if self.is_binary:
-        auc = roc_auc_score(y, y_pred)
-        self.logger.info("%s AUC: %.4f" % (split, auc))
+        auc = roc_auc_score(y, y_pred) #計算AUC
+        self.logger.info("%s AUC: %.4f" % (split, auc)) #紀錄AUC
         return auc
     elif self.is_multiclass:
-        y = np.asarray(y).astype(int)
+        y = np.asarray(y).astype(int) #將 y 轉換為 NumPy 陣列並確保是整數類型。
     
-        num_classes = len(np.unique(y))
+        num_classes = len(np.unique(y)) #統計有多少個不同的類別。
         
         if num_classes > 1:  
             
-            y_pred_normalized = y_pred / y_pred.sum(axis=1, keepdims=True)
-            auc = roc_auc_score(y, y_pred_normalized, multi_class='ovr')
+            y_pred_normalized = y_pred / y_pred.sum(axis=1, keepdims=True) #使 y_pred 機率總和為 1，確保是正規化的機率分佈。
+            auc = roc_auc_score(y, y_pred_normalized, multi_class='ovr') #計算「一對其餘 (OvR, One-vs-Rest)」的 AUC。
             self.logger.info("%s AUC (OvR): %.4f" % (split, auc))
             return auc
         else:
@@ -751,9 +761,13 @@ def calculate_auc(self, split, X, y, expvars):
         return mse
         
 
-def predict_proba(self, count_matrix, expvars=None):
-    with torch.no_grad():
-        batch_size = count_matrix.size(0)
+def predict_proba(self, count_matrix, expvars=None): #對給定的 count_matrix（詞頻矩陣或 bag-of-words 表示）進行推理，並返回預測機率（probability）。
+    """
+       count_matrix: 文檔的詞頻矩陣（Bag-of-Words 或類似的特徵表示）。
+       expvars: 額外的變數（可能是額外的輔助特徵，如元數據、外部變量等）。
+    """
+    with torch.no_grad(): #關閉梯度計算，提高效率並節省記憶體
+        batch_size = count_matrix.size(0) #取得批次大小，接著計算文件概念權重(doc_concept_weights)
         if self.inductive:
             doc_concept_weights = self.doc_concept_network(count_matrix)
         else:
@@ -761,25 +775,39 @@ def predict_proba(self, count_matrix, expvars=None):
         doc_concept_probs = F.softmax(doc_concept_weights, dim=1)  # convert to probabilities
         ones = torch.ones((batch_size, 1)).to(self.device)
         doc_concept_probs = torch.cat((ones, doc_concept_probs), dim=1)
+        """
+           加入一個恆等概念 (bias term)
+           為什麼要加 ones?
+              這可能是為了表示一個固定的 偏置項 (bias term)，類似於線性模型中的截距項 (intercept)。
+              torch.cat((ones, doc_concept_probs), dim=1)：將 ones 附加到概念機率矩陣的第一列。
+        """
 
-        if expvars is not None:
+        if expvars is not None: #如果有額外變數 (expvars)，將其拼接
             doc_concept_probs = torch.cat((doc_concept_probs, expvars), dim=1)
 
-        pred_weight = torch.matmul(doc_concept_probs, self.theta)
-        pred_proba = pred_weight.sigmoid()
+        pred_weight = torch.matmul(doc_concept_probs, self.theta) #計算預測加權權重 (pred_weight)，代表預測的未標準化分數（logits）。
+        pred_proba = pred_weight.sigmoid() #透過 Sigmoid 轉換為機率
     return pred_proba
 
-def get_train_doc_concept_probs(self):
+def get_train_doc_concept_probs(self): #計算訓練數據的文檔概念機率，即將訓練集中每篇文檔的特徵轉換為概念的機率分佈。
     if self.inductive:
         doc_concept_weights = self.doc_concept_network(self.bow_train)
     else:
         doc_concept_weights = self.doc_concept_weights.weight.data
     return F.softmax(doc_concept_weights, dim=1)  # convert to probabilities
 
-def visualize(self):
+def visualize(self): #可視化概念-詞彙分佈，通過 pyLDAvis 和 詞雲 (WordCloud) 來幫助我們理解每個概念（或話題）的關鍵詞分佈。
     with torch.no_grad():
         doc_concept_probs = self.get_train_doc_concept_probs()
-        # [n_concepts, vocab_size] weighted word counts of each concept
+        """
+           self.bow_train.shape = (num_documents, vocab_size)：這是訓練集中每篇文檔的詞頻向量。
+           這一步通過矩陣乘法：concept_word_counts = doc_concept_probs^T × bow_train
+           這樣，每個概念的詞頻是所有屬於該概念的文檔的詞頻加總。
+           將詞頻轉換為機率分佈：對於每個概念，將詞頻除以該概念的詞頻總和，得到每個詞的相對出現機率。
+           如果某個概念沒有任何詞（全 0），則會產生 NaN（因為除 0）。
+           這裡使用 1/vocab_size 填補這些 NaN，確保每個詞至少有一點機率。
+        """
+        # [n_concepts, vocab_size] weighted word counts of each concept 計算每個概念的詞彙機率(concept_word_sists)
         concept_word_counts = torch.matmul(doc_concept_probs.transpose(0, 1), self.bow_train)
         # normalize word counts to word distribution of each concept
         concept_word_dists = concept_word_counts / concept_word_counts.sum(1, True)
@@ -788,12 +816,21 @@ def visualize(self):
         vis_data = pyLDAvis.prepare(topic_term_dists=concept_word_dists.data.cpu().numpy(),
                                     doc_topic_dists=doc_concept_probs.data.cpu().numpy(),
                                     doc_lengths=self.doc_lens, vocab=self.vocab, term_frequency=self.word_counts)
+        """
+           pyLDAvis.prepare 參數解析
+              topic_term_dists：概念的詞分佈（形狀 (num_concepts, vocab_size)）。
+              doc_topic_dists：文檔的概念機率分佈（形狀 (num_documents, num_concepts)）。
+              doc_lengths：每篇文檔的詞數（形狀 (num_documents,)）。
+              vocab：詞彙表（形狀 (vocab_size,)）。
+              term_frequency：每個詞的整體頻率。
+        """
         
         html_path = os.path.join(self.out_dir, "visualization.html")
         pyLDAvis.save_html(vis_data, html_path)
         # pyLDAvis.save_html(vis_data, os.path.join(self.out_dir, "visualization.html"))
+        """vis_data 是 pyLDAvis 的可視化數據，接著將其保存為 HTML"""
 
-        for i in range(len(concept_word_dists)):
+        for i in range(len(concept_word_dists)): #生成詞雲 (WordCloud)
             concept_word_weights = dict(zip(self.vocab, concept_word_dists[i].cpu().numpy()))
             wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(concept_word_weights)
             plt.figure(figsize=(10, 5))
@@ -802,7 +839,7 @@ def visualize(self):
             plt.axis('off')
             plt.savefig(os.path.join(self.out_dir, f'concept_{i+1}_wordcloud.png'))
 
-        with open(html_path, "a+") as f:
+        with open(html_path, "a+") as f: # 整合 swiper.html（可能是前端視覺化工具）
 
             current_directory = os.getcwd()
             print("Current directory:", current_directory)
@@ -814,18 +851,38 @@ def visualize(self):
         
 
 # TODO: add filtering such as pos and tf
-def get_concept_words(self, top_k=10, concept_dist='dot'):
-    concept_embed = self.embedding_t.data.cpu().numpy()
-    word_embed = self.embedding_i.weight.data.cpu().numpy()
+def get_concept_words(self, top_k=10, concept_dist='dot'): #獲取每個概念（concept）最相關的詞彙，類似於主題建模中每個主題的關鍵詞提取。
+    """
+       top_k：控制每個概念返回的前 k 個最相關的詞，預設為 10。
+       concept_dist：選擇計算概念與詞語之間距離的方式：
+          預設為 'dot'（點積）。
+          其他選擇是 cdist() 提供的距離度量（如 'cosine', 'euclidean' 等）。
+    """
+    concept_embed = self.embedding_t.data.cpu().numpy() #concept_embed.shape = (n_concepts, embed_dim)：每個概念的嵌入向量。
+    word_embed = self.embedding_i.weight.data.cpu().numpy() #word_embed.shape = (vocab_size, embed_dim)：每個詞的嵌入向量。
+    #這兩個變數表示概念與詞彙在同一空間的嵌入向量，我們接下來要計算它們的相似度。
+
     if concept_dist == 'dot':
-        dist = -np.matmul(concept_embed, np.transpose(word_embed, (1, 0)))
+        dist = -np.matmul(concept_embed, np.transpose(word_embed, (1, 0))) #點積越大，表示詞與概念越相似。加上 - 之後，相似詞的數值變小，這樣排序時能獲取最相似的詞（最小值）。
     else:
-        dist = cdist(concept_embed, word_embed, metric=concept_dist)
-    nearest_word_idxs = np.argsort(dist, axis=1)[:, :top_k]  # indices of words with min cosine distance
+        dist = cdist(concept_embed, word_embed, metric=concept_dist) #cdist 來自 scipy.spatial.distance，可以計算各種距離。dist.shape = (n_concepts, vocab_size)，每個概念對所有詞的距離。
+    nearest_word_idxs = np.argsort(dist, axis=1)[:, :top_k]  # indices of words with min cosine distance 找到最相似的 top_k 個詞
+    """
+       np.argsort()：沿著詞的維度排序，返回索引值：
+          dist.shape = (n_concepts, vocab_size)
+          nearest_word_idxs.shape = (n_concepts, top_k)
+          nearest_word_idxs[j, :] 表示 第 j 個概念最相關的 top_k 個詞的索引。
+    """
     concepts = []
     for j in range(self.nconcepts):
         nearest_words = [self.vocab[i] for i in nearest_word_idxs[j, :]]
         concepts.append(nearest_words)
+    """
+       遍歷 nconcepts 個概念，找到對應的詞彙：
+          self.vocab[i]：從索引 i 對應到詞彙表中的具體詞。
+          concepts[j]：第 j 個概念的 top_k 關鍵詞。
+        concepts 是一個 list[list[str]]：concepts[0] 是 第 1 個概念的關鍵詞列表。
+    """
     return concepts
 
 
