@@ -2,6 +2,7 @@ import re
 import os
 import numpy as np
 from collections import Counter
+from sklearn.datasets import fetch_20newsgroups
 
 import torch
 import torch.nn as nn
@@ -14,13 +15,17 @@ from torch.utils.data import DataLoader, TensorDataset
 #######################
 
 # 假設 alt.atheism.txt 與此腳本在同一目錄下
-file_path = "alt.atheism.txt"
-with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-    text = f.read()
+#file_path = "alt.atheism.txt"
+#with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+#    text = f.read()
+
+#使用sklearn的20newsgroups資料集
+newsgroups = fetch_20newsgroups(subset='all', remove=('headers', 'footers', 'quotes'))
+docs = newsgroups.data
 
 # 根據雙換行分割成多個段落（作為獨立文檔）
-docs = text.split("\n\n")
-docs = [doc.strip() for doc in docs if doc.strip() != ""]
+#docs = text.split("\n\n")
+#docs = [doc.strip() for doc in docs if doc.strip() != ""]
 
 # 定義預處理函數：轉小寫、去除非字母字符、分詞
 def preprocess(doc):
