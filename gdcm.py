@@ -22,6 +22,9 @@ from toolbox.alias_multinomial import AliasMultinomial
 
 import optuna
 
+import importlib
+
+importlib.reload(consts)
 torch.manual_seed(consts.SEED)
 np.random.seed(consts.SEED)
 
@@ -388,502 +391,502 @@ class GuidedDiverseConceptMiner(nn.Module):
 
     """ code optimization task 1 (for checking if y_train/y_test is binary or continuous in the existing datasets)"""
 
-def check_binary_labels(self, y): #檢查y是否為二元標籤
-    unique_values = np.unique(y)
-    
-    return (len(unique_values) == 2 and set(unique_values).issubset({0, 1}))
-
-
-def check_multiclass_labels(self, y): #檢查y使否為多類別，且不是數值資料。ex : ['cat', 'dog', 'fish']
-    unique_values = np.unique(y)
-    num_of_vals = len(unique_values)
-    return num_of_vals > 2 and not np.issubdtype(y.dtype, np.number)
-
-
-def validate_labels(self): #驗證y_train和y_test是否為二元分類
-    if self.check_binary_labels(self.y_train):
-        print("y_train is binary")
-    else:
-        print("y_train is continuous, normalizing y_train...")
-    if self.check_binary_labels(self.y_test):
-        print("y_test is binary")
-    else:
-        print("y_test is continuous, normalizing y_test...")
-
-def normalize_labels(self, data, method='standard'): #對y_train或y_test進行標準化
-    if method == 'standard':
-        scaler = StandardScaler() #使用Z-score標準化
-    elif method == 'minmax':
-        scaler = MinMaxScaler() #使用Min-Max標準化
-    elif method == 'robust':
-        scaler = RobustScaler() #使用Robust標準化
-    else:
-        raise ValueError("Unsupported normalization method")
-    
-    return scaler.fit_transform(data.reshape(-1, 1)).flatten() #將data轉為2D矩陣，因為scaler.fit_transform()需要2D輸入。使用flatten()轉回1D，以維持原始y的形狀。
-
-
-
-
-def forward(self, doc, target, contexts, labels, per_doc_loss=None):
-    """
-    Args:
-        doc:        [batch_size,1] LongTensor of document indices
-        target:     [batch_size,1] LongTensor of target (pivot) word indices
-        contexts:   [batchsize,window_size] LongTensor of convext word indices
-        labels:     [batchsize,1] LongTensor of document labels
-
-        All arguments are tensors wrapped in Variables.
-
-        此函式的主要用途是計算LDA2Vec的loss function
-        1. 負採樣損失 (Negative Sampling Loss) : 用於詞嵌入學習
-        2. Dirichlet Loss : 用於主題建模 (Topic Modeling)
-        3. 預測損失 (Prediction Loss) : 用於預測labels
-        4. 多樣性損失 (Diversity Loss) : 用於鼓勵不同的概念向量(Concept Vectors)具有較大差異
-    """
-    batch_size, window_size = contexts.size()
-
-    # reweight loss by document length
-    w = autograd.Variable(self.docweights[doc.data]).to(self.device) #將tensor包進Variable中，支援backward()。autograd(自動微分)
-    w /= w.sum() #計算文件的權重
-    w *= w.size(0) #w會依據文檔長度進行標準化，以確保長文檔不會過度影響模型。
-
-    # construct document vector = weighted linear combination of concept vectors
-    if self.inductive:
-        doc_concept_weights = self.doc_concept_network(self.bow_train[doc]) #在CAN計算出來的
-    else:
-        doc_concept_weights = self.doc_concept_weights(doc) #同樣是CAN
-    doc_concept_probs = F.softmax(doc_concept_weights, dim=1)
-    '''
-        文檔向量是由概念向量 (concept vectors) 加權組合而成
-        透過softmax計算主題機率 (doc_concept_probs)，代表每個文檔與不同概念的關聯程度
-    '''
-    doc_concept_probs = doc_concept_probs.unsqueeze(1)  # (batches, 1, T)
-    concept_embeddings = self.embedding_t.expand(batch_size, -1, -1)  # (batches, T, E)
-    doc_vector = torch.bmm(doc_concept_probs, concept_embeddings)  # (batches, 1, E)
-    doc_vector = doc_vector.squeeze(dim=1)  # (batches, E)
-    doc_vector = self.dropout2(doc_vector)
-    """
-        使用批次矩陣乘法(torch.bmm)，將主題機率(doc_concept_probs)與主題嵌入(concept embeddings)相乘，得到文檔向量(doc_vector)
-    """
-
-    # sample negative word indices for negative sampling loss; approximation by sampling from the whole vocab
-    if self.device == "cpu":
-        nwords = torch.multinomial(self.weights, batch_size * window_size * self.nnegs,
-                                    replacement=True).view(batch_size, -1)
-        nwords = autograd.Variable(nwords)
-    else:
-        nwords = self.multinomial.draw(batch_size * window_size * self.nnegs)
-        nwords = autograd.Variable(nwords).view(batch_size, window_size * self.nnegs)
-    """
-        負採樣透過torch.multinomial從整個詞彙表(vocabulary)中隨機抽取nnegs個詞作為負樣本(negative samples)
-        用來近似word2vec的Skip-gram模型，以提高訓練效率
-    """
-
-    # compute word vectors
-    ivectors = self.dropout1(self.embedding_i(target))  # (batches, E)
-    ovectors = self.embedding_i(contexts)  # (batches, window_size, E)
-    nvectors = self.embedding_i(nwords).neg()  # row vector
-    """
-        計算目標詞和負樣本詞向量
-        ivectors : 目標詞向量
-        ovectors : 上下文詞向量
-        nvectors : 負樣本詞向量
-    """
-
-    # construct "context" vector defined by lda2vec
-    context_vectors = doc_vector + ivectors
-    context_vectors = context_vectors.unsqueeze(2)  # (batches, E, 1)
-    """
-        context_vectors = 文檔向量 + 目標詞向量
-        context_vectors表示LDA2Vec定義的語境 (Context Representation)
-    """
-
-    # compose negative sampling loss
-    oloss = torch.bmm(ovectors, context_vectors).squeeze(dim=2).sigmoid().clamp(min=consts.EPS).log().sum(1)
-    nloss = torch.bmm(nvectors, context_vectors).squeeze(dim=2).sigmoid().clamp(min=consts.EPS).log().sum(1)
-    negative_sampling_loss = (oloss + nloss).neg()
-    negative_sampling_loss *= w  # downweight loss for each document
-    negative_sampling_loss = negative_sampling_loss.mean()  # mean over the batch
-    """
-        正樣本損失nloss : 計算ovectors和context_vectors之間的內積，並通過sigmoid運算
-        負樣本損失oloss : 計算nvectors和context_vectors之間的內積
-        最終損失negative_sampling_loss : 兩者相加取負號，然後根據文檔長度w加權
-        公式4
-    """
-
-    # compose dirichlet loss
-    doc_concept_probs = doc_concept_probs.squeeze(dim=1)  # (batches, T)
-    doc_concept_probs = doc_concept_probs.clamp(min=consts.EPS)
-    dirichlet_loss = doc_concept_probs.log().sum(1)  # (batches, 1)
-    dirichlet_loss *= self.lam * (1.0 - self.alpha)
-    dirichlet_loss *= w  # downweight loss for each document
-    dirichlet_loss = dirichlet_loss.mean()  # mean over the entire batch
-    """
-        Dirichlet Loss控制主題分布，使的不同文檔的主題權重更加平滑
-        self.lam和self.alpha是正則化超參數
-        公式5
-    """
-
-    ones = torch.ones((batch_size, 1)).to(self.device)
-    doc_concept_probs = torch.cat((ones, doc_concept_probs), dim=1)
-
-    # expand doc_concept_probs vector with explanatory variables
-    if self.expvars_train is not None:
-        doc_concept_probs = torch.cat((doc_concept_probs, self.expvars_train[doc, :]),
-                                        dim=1)
-    # compose prediction loss
-    # [batch_size] = torch.matmul([batch_size, nconcepts], [nconcepts])
-    # pred_weight = torch.matmul(doc_concept_probs.unsqueeze(0), self.theta).squeeze(0)
-    # print(doc_concept_probs.shape)
-    # print(self.theta.shape)
-    pred_weight = torch.matmul(doc_concept_probs, self.theta)
-    # print(pred_weight)
-    # print(labels)
-
-    if self.is_binary:
-        pred_loss = F.binary_cross_entropy_with_logits(pred_weight, labels,
-                                                    weight=w, reduction='none')
-    elif self.is_multiclass:
-        pred_loss = F.cross_entropy(pred_weight, labels.long(), reduction = 'none')
-    else:
-        pred_loss = F.mse_loss(pred_weight, labels, reduction='none')
-        pred_loss = pred_loss * w # applying the weight element-wise to the calcuated loss
-
-    pred_loss *= self.rho
-    pred_loss = pred_loss.mean()
-    """
-        計算預測損失 (Prediction Loss)
-        binary_cross_entropy_with_logits適用於二元分類
-        cross_entropy適用於多分類
-        mse_loss適用於回歸
-        公式8
-    """
-
-    # compose diversity loss
-    #   1. First compute \sum_i \sum_j log(sigmoid(T_i, T_j))
-    #   2. Then compute \sum_i log(sigmoid(T_i, T_i))
-    #   3. Loss = (\sum_i \sum_j log(sigmoid(T_i, T_j)) - \sum_i log(sigmoid(T_i, T_i)) )
-    #           = \sum_i \sum_{j > i} log(sigmoid(T_i, T_j))
-    div_loss = torch.mm(self.embedding_t,
-                        torch.t(self.embedding_t)).sigmoid().clamp(min=consts.EPS).log().sum() \
-                - (self.embedding_t * self.embedding_t).sigmoid().clamp(min=consts.EPS).log().sum()
-    div_loss /= 2.0  # taking care of duplicate pairs T_i, T_j and T_j, T_i
-    div_loss = div_loss.repeat(batch_size)
-    div_loss *= w  # downweight by document lengths
-    div_loss *= self.eta
-    div_loss = div_loss.mean()  # mean over the entire batch
-    """
-        計算多樣性損失 (Diversity Loss)
-        確保不同的主題嵌入 (Topic Embeddings) 之間盡可能不相似，避免過度重疊
-        公式6
-    """
-
-    return negative_sampling_loss, dirichlet_loss, pred_loss, div_loss
-    #返回4種損失，作為模型學習的目標
-
-def fit(self, lr=0.01, nepochs=200, pred_only_epochs=20,
-        batch_size=100, weight_decay=0.01, grad_clip=5, save_epochs=10, concept_dist="dot"):
-    """
-    Train the GDCM model
-
-    Parameters
-    ----------
-    lr : float
-        Learning rate 學習率
-    nepochs : int
-        The number of training epochs 訓練的總epoch數
-    pred_only_epochs : int
-        The number of epochs optimized with prediction loss only 只優化預測損失(prediction loss)的epochs數量
-    batch_size : int
-        Batch size 批次大小
-    weight_decay : float
-        Adam optimizer weight decay (L2 penalty) Adam優化器的L2正則化權重衰減
-    grad_clip : float
-        Maximum gradients magnitude. Gradients will be clipped within the range [-grad_clip, grad_clip] 梯度裁減的範圍，避免梯度爆炸
-    save_epochs : int
-        The number of epochs in between saving the model weights 每saved_epochs個epoch儲存一次模型
-    concept_dist: str
-        Concept vectors distance metric. Choices are 'dot', 'correlation', 'cosine', 'euclidean', 'hamming'. 概念向量的距離度量(可選擇dot, correlation, cosine, euclidean, hamming)
-
-    Returns
-    -------
-    metrics : ndarray, shape (n_epochs, 6)
-        Training metrics from each epoch including: total_loss, avg_sgns_loss, avg_diversity_loss, avg_pred_loss,
-        avg_diversity_loss, train_auc, test_auc
-    -------
-    這個fit方法是GDCM模型的訓練主函式
-    1. 讀取訓練數據並設定Adam優化器
-    2. 進行nepochs次的訓練，每個batch計算SGNS、Dirichlet、預測、多樣性損失
-    3. 根據不同的epoch階段，調整loss function以確保模型逐步收斂
-    4. 使用梯度裁減(grad_clip)防止梯度爆炸
-    5. 計算並記錄AUC，每save_epochs儲存一次模型
-    6. 訓練完成後儲存最終模型並回傳訓練結果
-    """
-    train_dataloader = torch.utils.data.DataLoader(self.train_dataset, batch_size, shuffle=True,
-                                                    num_workers=4, pin_memory=True,
-                                                    drop_last=False)
-    """
-        建立一個train_dataloader，從self.train_dataset讀取訓練數據，並且設置batch size以及是否打亂順序
-    """
-    
-    
-    self.to(self.device)
-
-    train_metrics_file = open(os.path.join(self.out_dir, "train_metrics.txt"), "w")
-    train_metrics_file.write("total_loss,avg_sgns_loss,avg_dirichlet_loss,avg_pred_loss,"
-                                "avg_div_loss,train_auc,test_auc\n")
-
-    # SGD generalizes better: https://arxiv.org/abs/1705.08292
-    optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay) #使用Adam優化器來更新模型的參數，並使用weight_decay來進行L2正則化
-    nwindows = len(self.train_dataset)
-    results = []
-    for epoch in range(nepochs): #進行nepochs次的訓練
-        total_sgns_loss = 0.0
-        total_dirichlet_loss = 0.0
-        total_pred_loss = 0.0
-        total_diversity_loss = 0.0
-
-        self.train()
-        for batch in train_dataloader: #每次從dataloader裡取一個batch
-            batch = batch.long() #確保所有數據轉為long型別
-            batch = batch.to(self.device) #將數據移到GPU
-            doc = batch[:, 0]
-            iword = batch[:, 1]
-            owords = batch[:, 2:-1]
-            labels = batch[:, -1].float()
-
-            sgns_loss, dirichlet_loss, pred_loss, div_loss = self(doc, iword, owords, labels) #代入forward()的方法計算loss
-            if epoch < pred_only_epochs: #在進行次數超過pred_only_epochs後，才加入其他損失
-                loss = pred_loss
-            else:
-                loss = sgns_loss + dirichlet_loss + pred_loss + div_loss
-            optimizer.zero_grad()
-            loss.backward() #執行反向傳播，並計算梯度
-
-            # gradient clipping 確保梯度值不會超過grap_clip，避免梯度爆炸
-            for p in self.parameters():
-                if p.requires_grad and p.grad is not None:
-                    p.grad = p.grad.clamp(min=-grad_clip, max=grad_clip)
-
-            optimizer.step() #更新模型參數
-
-            nsamples = batch.size(0)
-
-            total_sgns_loss += sgns_loss.detach().cpu().numpy() * nsamples
-            total_dirichlet_loss += dirichlet_loss.detach().cpu().numpy() * nsamples
-            total_pred_loss += pred_loss.data.detach().cpu().numpy() * nsamples
-            total_diversity_loss += div_loss.data.detach().cpu().numpy() * nsamples
-
-        #Calculate train and test AUC
-        train_auc = self.calculate_auc("Train", self.bow_train, self.y_train, self.expvars_train)
-        test_auc = 0.0
-        if self.inductive:
-            test_auc = self.calculate_auc("Test", self.bow_test, self.y_test, self.expvars_test)
-
-        total_loss = (total_sgns_loss + total_dirichlet_loss + total_pred_loss + total_diversity_loss) / nwindows
-        avg_sgns_loss = total_sgns_loss / nwindows
-        avg_dirichlet_loss = total_dirichlet_loss / nwindows
-        avg_pred_loss = total_pred_loss / nwindows
-        avg_diversity_loss = total_diversity_loss / nwindows
-        self.logger.info("epoch %d/%d:" % (epoch, nepochs))
-        self.logger.info("Total loss: %.4f" % total_loss)
-        self.logger.info("SGNS loss: %.4f" % avg_sgns_loss)
-        self.logger.info("Dirichlet loss: %.4f" % avg_dirichlet_loss)
-        self.logger.info("Prediction loss: %.4f" % avg_pred_loss)
-        self.logger.info("Diversity loss: %.4f" % avg_diversity_loss)
-        concepts = self.get_concept_words(concept_dist=concept_dist)
-        with open(os.path.join(self.concept_dir, "epoch%d.txt" % epoch), "w") as concept_file:
-            for i, concept_words in enumerate(concepts):
-                self.logger.info('concept %d: %s' % (i + 1, ' '.join(concept_words)))
-                concept_file.write('concept %d: %s\n' % (i + 1, ' '.join(concept_words)))
-        metrics = (total_loss, avg_sgns_loss, avg_dirichlet_loss, avg_pred_loss,
-                    avg_diversity_loss, train_auc, test_auc)
-        train_metrics_file.write("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % metrics)
-        train_metrics_file.flush()
-        results.append(metrics)
-        if (epoch + 1) % save_epochs == 0: #每隔save_epochs存檔一次模型的state_dict
-            torch.save(self.state_dict(), os.path.join(self.model_dir, "epoch%d.pytorch" % epoch))
-            with torch.no_grad():
-                doc_concept_probs = self.get_train_doc_concept_probs()
-                np.save(os.path.join(self.model_dir, "epoch%d_train_doc_concept_probs.npy" % epoch),
-                        doc_concept_probs.cpu().detach().numpy())
-
-    torch.save(self.state_dict(), os.path.join(self.model_dir, "epoch%d.pytorch" % (nepochs - 1))) #儲存最終訓練完成的模型
-    return np.array(results)
-    """
-       回傳一個numpy陣列，包含
-       total loss
-       avg_sgns_loss
-       avg_dirichlet_loss
-       avg_predict_loss
-       avg_diversity_loss
-       train_auc
-       test_auc
-    """
-
-def calculate_auc(self, split, X, y, expvars): #根據模型種類計算AUC或MSE
-    """
-       split : 指示dataset是train或test
-       x : 特徵矩陣(bag-of-words或其他表示)
-       y : 標籤(真實值)
-       expvars : 額外的變數(在predict_proba中使用)
-    """
-    y_pred = self.predict_proba(X, expvars).cpu().detach().numpy()
-    """
-       self.predict_proba(X, expvars)：模型對輸入 X 進行推理，返回預測機率。
-       .cpu().detach().numpy()：將 PyTorch tensor 轉換成 NumPy 陣列，因為 roc_auc_score 需要 NumPy 格式的輸入。
-    """
-    if self.is_binary:
-        auc = roc_auc_score(y, y_pred) #計算AUC
-        self.logger.info("%s AUC: %.4f" % (split, auc)) #紀錄AUC
-        return auc
-    elif self.is_multiclass:
-        y = np.asarray(y).astype(int) #將 y 轉換為 NumPy 陣列並確保是整數類型。
-    
-        num_classes = len(np.unique(y)) #統計有多少個不同的類別。
+    def check_binary_labels(self, y): #檢查y是否為二元標籤
+        unique_values = np.unique(y)
         
-        if num_classes > 1:  
-            
-            y_pred_normalized = y_pred / y_pred.sum(axis=1, keepdims=True) #使 y_pred 機率總和為 1，確保是正規化的機率分佈。
-            auc = roc_auc_score(y, y_pred_normalized, multi_class='ovr') #計算「一對其餘 (OvR, One-vs-Rest)」的 AUC。
-            self.logger.info("%s AUC (OvR): %.4f" % (split, auc))
-            return auc
-        else:
-            #in case only one class is present
-            self.logger.warning("Only one class present in true labels. ROC AUC score is not defined in that case.")
-            return None  
-    else:
-        mse = mean_squared_error(y, y_pred)
-        # mae = mean_absolute_error(y, y_pred)
-        # r2 = r2_score(y, y_pred)
-        self.logger.info("%s MSE: %.4f" % (split, mse))
-        return mse
-        
+        return (len(unique_values) == 2 and set(unique_values).issubset({0, 1}))
 
-def predict_proba(self, count_matrix, expvars=None): #對給定的 count_matrix（詞頻矩陣或 bag-of-words 表示）進行推理，並返回預測機率（probability）。
-    """
-       count_matrix: 文檔的詞頻矩陣（Bag-of-Words 或類似的特徵表示）。
-       expvars: 額外的變數（可能是額外的輔助特徵，如元數據、外部變量等）。
-    """
-    with torch.no_grad(): #關閉梯度計算，提高效率並節省記憶體
-        batch_size = count_matrix.size(0) #取得批次大小，接著計算文件概念權重(doc_concept_weights)
-        if self.inductive:
-            doc_concept_weights = self.doc_concept_network(count_matrix)
+
+    def check_multiclass_labels(self, y): #檢查y使否為多類別，且不是數值資料。ex : ['cat', 'dog', 'fish']
+        unique_values = np.unique(y)
+        num_of_vals = len(unique_values)
+        return num_of_vals > 2 and not np.issubdtype(y.dtype, np.number)
+
+
+    def validate_labels(self): #驗證y_train和y_test是否為二元分類
+        if self.check_binary_labels(self.y_train):
+            print("y_train is binary")
         else:
-            doc_concept_weights = self.doc_concept_weights.weight.data
-        doc_concept_probs = F.softmax(doc_concept_weights, dim=1)  # convert to probabilities
+            print("y_train is continuous, normalizing y_train...")
+        if self.check_binary_labels(self.y_test):
+            print("y_test is binary")
+        else:
+            print("y_test is continuous, normalizing y_test...")
+
+    def normalize_labels(self, data, method='standard'): #對y_train或y_test進行標準化
+        if method == 'standard':
+            scaler = StandardScaler() #使用Z-score標準化
+        elif method == 'minmax':
+            scaler = MinMaxScaler() #使用Min-Max標準化
+        elif method == 'robust':
+            scaler = RobustScaler() #使用Robust標準化
+        else:
+            raise ValueError("Unsupported normalization method")
+        
+        return scaler.fit_transform(data.reshape(-1, 1)).flatten() #將data轉為2D矩陣，因為scaler.fit_transform()需要2D輸入。使用flatten()轉回1D，以維持原始y的形狀。
+
+
+
+
+    def forward(self, doc, target, contexts, labels, per_doc_loss=None):
+        """
+        Args:
+            doc:        [batch_size,1] LongTensor of document indices
+            target:     [batch_size,1] LongTensor of target (pivot) word indices
+            contexts:   [batchsize,window_size] LongTensor of convext word indices
+            labels:     [batchsize,1] LongTensor of document labels
+
+            All arguments are tensors wrapped in Variables.
+
+            此函式的主要用途是計算LDA2Vec的loss function
+            1. 負採樣損失 (Negative Sampling Loss) : 用於詞嵌入學習
+            2. Dirichlet Loss : 用於主題建模 (Topic Modeling)
+            3. 預測損失 (Prediction Loss) : 用於預測labels
+            4. 多樣性損失 (Diversity Loss) : 用於鼓勵不同的概念向量(Concept Vectors)具有較大差異
+        """
+        batch_size, window_size = contexts.size()
+
+        # reweight loss by document length
+        w = autograd.Variable(self.docweights[doc.data]).to(self.device) #將tensor包進Variable中，支援backward()。autograd(自動微分)
+        w /= w.sum() #計算文件的權重
+        w *= w.size(0) #w會依據文檔長度進行標準化，以確保長文檔不會過度影響模型。
+
+        # construct document vector = weighted linear combination of concept vectors
+        if self.inductive:
+            doc_concept_weights = self.doc_concept_network(self.bow_train[doc]) #在CAN計算出來的
+        else:
+            doc_concept_weights = self.doc_concept_weights(doc) #同樣是CAN
+        doc_concept_probs = F.softmax(doc_concept_weights, dim=1)
+        '''
+            文檔向量是由概念向量 (concept vectors) 加權組合而成
+            透過softmax計算主題機率 (doc_concept_probs)，代表每個文檔與不同概念的關聯程度
+        '''
+        doc_concept_probs = doc_concept_probs.unsqueeze(1)  # (batches, 1, T)
+        concept_embeddings = self.embedding_t.expand(batch_size, -1, -1)  # (batches, T, E)
+        doc_vector = torch.bmm(doc_concept_probs, concept_embeddings)  # (batches, 1, E)
+        doc_vector = doc_vector.squeeze(dim=1)  # (batches, E)
+        doc_vector = self.dropout2(doc_vector)
+        """
+            使用批次矩陣乘法(torch.bmm)，將主題機率(doc_concept_probs)與主題嵌入(concept embeddings)相乘，得到文檔向量(doc_vector)
+        """
+
+        # sample negative word indices for negative sampling loss; approximation by sampling from the whole vocab
+        if self.device == "cpu":
+            nwords = torch.multinomial(self.weights, batch_size * window_size * self.nnegs,
+                                        replacement=True).view(batch_size, -1)
+            nwords = autograd.Variable(nwords)
+        else:
+            nwords = self.multinomial.draw(batch_size * window_size * self.nnegs)
+            nwords = autograd.Variable(nwords).view(batch_size, window_size * self.nnegs)
+        """
+            負採樣透過torch.multinomial從整個詞彙表(vocabulary)中隨機抽取nnegs個詞作為負樣本(negative samples)
+            用來近似word2vec的Skip-gram模型，以提高訓練效率
+        """
+
+        # compute word vectors
+        ivectors = self.dropout1(self.embedding_i(target))  # (batches, E)
+        ovectors = self.embedding_i(contexts)  # (batches, window_size, E)
+        nvectors = self.embedding_i(nwords).neg()  # row vector
+        """
+            計算目標詞和負樣本詞向量
+            ivectors : 目標詞向量
+            ovectors : 上下文詞向量
+            nvectors : 負樣本詞向量
+        """
+
+        # construct "context" vector defined by lda2vec
+        context_vectors = doc_vector + ivectors
+        context_vectors = context_vectors.unsqueeze(2)  # (batches, E, 1)
+        """
+            context_vectors = 文檔向量 + 目標詞向量
+            context_vectors表示LDA2Vec定義的語境 (Context Representation)
+        """
+
+        # compose negative sampling loss
+        oloss = torch.bmm(ovectors, context_vectors).squeeze(dim=2).sigmoid().clamp(min=consts.EPS).log().sum(1)
+        nloss = torch.bmm(nvectors, context_vectors).squeeze(dim=2).sigmoid().clamp(min=consts.EPS).log().sum(1)
+        negative_sampling_loss = (oloss + nloss).neg()
+        negative_sampling_loss *= w  # downweight loss for each document
+        negative_sampling_loss = negative_sampling_loss.mean()  # mean over the batch
+        """
+            正樣本損失nloss : 計算ovectors和context_vectors之間的內積，並通過sigmoid運算
+            負樣本損失oloss : 計算nvectors和context_vectors之間的內積
+            最終損失negative_sampling_loss : 兩者相加取負號，然後根據文檔長度w加權
+            公式4
+        """
+
+        # compose dirichlet loss
+        doc_concept_probs = doc_concept_probs.squeeze(dim=1)  # (batches, T)
+        doc_concept_probs = doc_concept_probs.clamp(min=consts.EPS)
+        dirichlet_loss = doc_concept_probs.log().sum(1)  # (batches, 1)
+        dirichlet_loss *= self.lam * (1.0 - self.alpha)
+        dirichlet_loss *= w  # downweight loss for each document
+        dirichlet_loss = dirichlet_loss.mean()  # mean over the entire batch
+        """
+            Dirichlet Loss控制主題分布，使的不同文檔的主題權重更加平滑
+            self.lam和self.alpha是正則化超參數
+            公式5
+        """
+
         ones = torch.ones((batch_size, 1)).to(self.device)
         doc_concept_probs = torch.cat((ones, doc_concept_probs), dim=1)
+
+        # expand doc_concept_probs vector with explanatory variables
+        if self.expvars_train is not None:
+            doc_concept_probs = torch.cat((doc_concept_probs, self.expvars_train[doc, :]),
+                                            dim=1)
+        # compose prediction loss
+        # [batch_size] = torch.matmul([batch_size, nconcepts], [nconcepts])
+        # pred_weight = torch.matmul(doc_concept_probs.unsqueeze(0), self.theta).squeeze(0)
+        # print(doc_concept_probs.shape)
+        # print(self.theta.shape)
+        pred_weight = torch.matmul(doc_concept_probs, self.theta)
+        # print(pred_weight)
+        # print(labels)
+
+        if self.is_binary:
+            pred_loss = F.binary_cross_entropy_with_logits(pred_weight, labels,
+                                                        weight=w, reduction='none')
+        elif self.is_multiclass:
+            pred_loss = F.cross_entropy(pred_weight, labels.long(), reduction = 'none')
+        else:
+            pred_loss = F.mse_loss(pred_weight, labels, reduction='none')
+            pred_loss = pred_loss * w # applying the weight element-wise to the calcuated loss
+
+        pred_loss *= self.rho
+        pred_loss = pred_loss.mean()
         """
-           加入一個恆等概念 (bias term)
-           為什麼要加 ones?
-              這可能是為了表示一個固定的 偏置項 (bias term)，類似於線性模型中的截距項 (intercept)。
-              torch.cat((ones, doc_concept_probs), dim=1)：將 ones 附加到概念機率矩陣的第一列。
+            計算預測損失 (Prediction Loss)
+            binary_cross_entropy_with_logits適用於二元分類
+            cross_entropy適用於多分類
+            mse_loss適用於回歸
+            公式8
         """
 
-        if expvars is not None: #如果有額外變數 (expvars)，將其拼接
-            doc_concept_probs = torch.cat((doc_concept_probs, expvars), dim=1)
-
-        pred_weight = torch.matmul(doc_concept_probs, self.theta) #計算預測加權權重 (pred_weight)，代表預測的未標準化分數（logits）。
-        pred_proba = pred_weight.sigmoid() #透過 Sigmoid 轉換為機率
-    return pred_proba
-
-def get_train_doc_concept_probs(self): #計算訓練數據的文檔概念機率，即將訓練集中每篇文檔的特徵轉換為概念的機率分佈。
-    if self.inductive:
-        doc_concept_weights = self.doc_concept_network(self.bow_train)
-    else:
-        doc_concept_weights = self.doc_concept_weights.weight.data
-    return F.softmax(doc_concept_weights, dim=1)  # convert to probabilities
-
-def visualize(self): #可視化概念-詞彙分佈，通過 pyLDAvis 和 詞雲 (WordCloud) 來幫助我們理解每個概念（或話題）的關鍵詞分佈。
-    with torch.no_grad():
-        doc_concept_probs = self.get_train_doc_concept_probs()
+        # compose diversity loss
+        #   1. First compute \sum_i \sum_j log(sigmoid(T_i, T_j))
+        #   2. Then compute \sum_i log(sigmoid(T_i, T_i))
+        #   3. Loss = (\sum_i \sum_j log(sigmoid(T_i, T_j)) - \sum_i log(sigmoid(T_i, T_i)) )
+        #           = \sum_i \sum_{j > i} log(sigmoid(T_i, T_j))
+        div_loss = torch.mm(self.embedding_t,
+                            torch.t(self.embedding_t)).sigmoid().clamp(min=consts.EPS).log().sum() \
+                    - (self.embedding_t * self.embedding_t).sigmoid().clamp(min=consts.EPS).log().sum()
+        div_loss /= 2.0  # taking care of duplicate pairs T_i, T_j and T_j, T_i
+        div_loss = div_loss.repeat(batch_size)
+        div_loss *= w  # downweight by document lengths
+        div_loss *= self.eta
+        div_loss = div_loss.mean()  # mean over the entire batch
         """
-           self.bow_train.shape = (num_documents, vocab_size)：這是訓練集中每篇文檔的詞頻向量。
-           這一步通過矩陣乘法：concept_word_counts = doc_concept_probs^T × bow_train
-           這樣，每個概念的詞頻是所有屬於該概念的文檔的詞頻加總。
-           將詞頻轉換為機率分佈：對於每個概念，將詞頻除以該概念的詞頻總和，得到每個詞的相對出現機率。
-           如果某個概念沒有任何詞（全 0），則會產生 NaN（因為除 0）。
-           這裡使用 1/vocab_size 填補這些 NaN，確保每個詞至少有一點機率。
+            計算多樣性損失 (Diversity Loss)
+            確保不同的主題嵌入 (Topic Embeddings) 之間盡可能不相似，避免過度重疊
+            公式6
         """
-        # [n_concepts, vocab_size] weighted word counts of each concept 計算每個概念的詞彙機率(concept_word_sists)
-        concept_word_counts = torch.matmul(doc_concept_probs.transpose(0, 1), self.bow_train)
-        # normalize word counts to word distribution of each concept
-        concept_word_dists = concept_word_counts / concept_word_counts.sum(1, True)
-        # fill NaN with 1/vocab_size in case a concept has all zero word distribution
-        concept_word_dists[concept_word_dists != concept_word_dists] = 1.0 / concept_word_dists.shape[1]
-        vis_data = pyLDAvis.prepare(topic_term_dists=concept_word_dists.data.cpu().numpy(),
-                                    doc_topic_dists=doc_concept_probs.data.cpu().numpy(),
-                                    doc_lengths=self.doc_lens, vocab=self.vocab, term_frequency=self.word_counts)
+
+        return negative_sampling_loss, dirichlet_loss, pred_loss, div_loss
+        #返回4種損失，作為模型學習的目標
+
+    def fit(self, lr=0.01, nepochs=200, pred_only_epochs=20,
+            batch_size=100, weight_decay=0.01, grad_clip=5, save_epochs=10, concept_dist="dot"):
         """
-           pyLDAvis.prepare 參數解析
-              topic_term_dists：概念的詞分佈（形狀 (num_concepts, vocab_size)）。
-              doc_topic_dists：文檔的概念機率分佈（形狀 (num_documents, num_concepts)）。
-              doc_lengths：每篇文檔的詞數（形狀 (num_documents,)）。
-              vocab：詞彙表（形狀 (vocab_size,)）。
-              term_frequency：每個詞的整體頻率。
+        Train the GDCM model
+
+        Parameters
+        ----------
+        lr : float
+            Learning rate 學習率
+        nepochs : int
+            The number of training epochs 訓練的總epoch數
+        pred_only_epochs : int
+            The number of epochs optimized with prediction loss only 只優化預測損失(prediction loss)的epochs數量
+        batch_size : int
+            Batch size 批次大小
+        weight_decay : float
+            Adam optimizer weight decay (L2 penalty) Adam優化器的L2正則化權重衰減
+        grad_clip : float
+            Maximum gradients magnitude. Gradients will be clipped within the range [-grad_clip, grad_clip] 梯度裁減的範圍，避免梯度爆炸
+        save_epochs : int
+            The number of epochs in between saving the model weights 每saved_epochs個epoch儲存一次模型
+        concept_dist: str
+            Concept vectors distance metric. Choices are 'dot', 'correlation', 'cosine', 'euclidean', 'hamming'. 概念向量的距離度量(可選擇dot, correlation, cosine, euclidean, hamming)
+
+        Returns
+        -------
+        metrics : ndarray, shape (n_epochs, 6)
+            Training metrics from each epoch including: total_loss, avg_sgns_loss, avg_diversity_loss, avg_pred_loss,
+            avg_diversity_loss, train_auc, test_auc
+        -------
+        這個fit方法是GDCM模型的訓練主函式
+        1. 讀取訓練數據並設定Adam優化器
+        2. 進行nepochs次的訓練，每個batch計算SGNS、Dirichlet、預測、多樣性損失
+        3. 根據不同的epoch階段，調整loss function以確保模型逐步收斂
+        4. 使用梯度裁減(grad_clip)防止梯度爆炸
+        5. 計算並記錄AUC，每save_epochs儲存一次模型
+        6. 訓練完成後儲存最終模型並回傳訓練結果
+        """
+        train_dataloader = torch.utils.data.DataLoader(self.train_dataset, batch_size, shuffle=True,
+                                                        num_workers=4, pin_memory=True,
+                                                        drop_last=False)
+        """
+            建立一個train_dataloader，從self.train_dataset讀取訓練數據，並且設置batch size以及是否打亂順序
         """
         
-        html_path = os.path.join(self.out_dir, "visualization.html")
-        pyLDAvis.save_html(vis_data, html_path)
-        # pyLDAvis.save_html(vis_data, os.path.join(self.out_dir, "visualization.html"))
-        """vis_data 是 pyLDAvis 的可視化數據，接著將其保存為 HTML"""
+        
+        self.to(self.device)
 
-        for i in range(len(concept_word_dists)): #生成詞雲 (WordCloud)
-            concept_word_weights = dict(zip(self.vocab, concept_word_dists[i].cpu().numpy()))
-            wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(concept_word_weights)
-            plt.figure(figsize=(10, 5))
-            plt.imshow(wordcloud, interpolation='bilinear')
-            plt.title(f'Concept {i+1} Word Cloud')
-            plt.axis('off')
-            plt.savefig(os.path.join(self.out_dir, f'concept_{i+1}_wordcloud.png'))
+        train_metrics_file = open(os.path.join(self.out_dir, "train_metrics.txt"), "w")
+        train_metrics_file.write("total_loss,avg_sgns_loss,avg_dirichlet_loss,avg_pred_loss,"
+                                    "avg_div_loss,train_auc,test_auc\n")
 
-        with open(html_path, "a+") as f: # 整合 swiper.html（可能是前端視覺化工具）
+        # SGD generalizes better: https://arxiv.org/abs/1705.08292
+        optimizer = optim.Adam(self.parameters(), lr=lr, weight_decay=weight_decay) #使用Adam優化器來更新模型的參數，並使用weight_decay來進行L2正則化
+        nwindows = len(self.train_dataset)
+        results = []
+        for epoch in range(nepochs): #進行nepochs次的訓練
+            total_sgns_loss = 0.0
+            total_dirichlet_loss = 0.0
+            total_pred_loss = 0.0
+            total_diversity_loss = 0.0
 
-            current_directory = os.getcwd()
-            print("Current directory:", current_directory)
-            swiper_vis_path = current_directory + '/swiper.html'
-            with open(swiper_vis_path, 'r') as swipertext:
-                swiper = swipertext.read() 
+            self.train()
+            for batch in train_dataloader: #每次從dataloader裡取一個batch
+                batch = batch.long() #確保所有數據轉為long型別
+                batch = batch.to(self.device) #將數據移到GPU
+                doc = batch[:, 0]
+                iword = batch[:, 1]
+                owords = batch[:, 2:-1]
+                labels = batch[:, -1].float()
+
+                sgns_loss, dirichlet_loss, pred_loss, div_loss = self(doc, iword, owords, labels) #代入forward()的方法計算loss
+                if epoch < pred_only_epochs: #在進行次數超過pred_only_epochs後，才加入其他損失
+                    loss = pred_loss
+                else:
+                    loss = sgns_loss + dirichlet_loss + pred_loss + div_loss
+                optimizer.zero_grad()
+                loss.backward() #執行反向傳播，並計算梯度
+
+                # gradient clipping 確保梯度值不會超過grap_clip，避免梯度爆炸
+                for p in self.parameters():
+                    if p.requires_grad and p.grad is not None:
+                        p.grad = p.grad.clamp(min=-grad_clip, max=grad_clip)
+
+                optimizer.step() #更新模型參數
+
+                nsamples = batch.size(0)
+
+                total_sgns_loss += sgns_loss.detach().cpu().numpy() * nsamples
+                total_dirichlet_loss += dirichlet_loss.detach().cpu().numpy() * nsamples
+                total_pred_loss += pred_loss.data.detach().cpu().numpy() * nsamples
+                total_diversity_loss += div_loss.data.detach().cpu().numpy() * nsamples
+
+            #Calculate train and test AUC
+            train_auc = self.calculate_auc("Train", self.bow_train, self.y_train, self.expvars_train)
+            test_auc = 0.0
+            if self.inductive:
+                test_auc = self.calculate_auc("Test", self.bow_test, self.y_test, self.expvars_test)
+
+            total_loss = (total_sgns_loss + total_dirichlet_loss + total_pred_loss + total_diversity_loss) / nwindows
+            avg_sgns_loss = total_sgns_loss / nwindows
+            avg_dirichlet_loss = total_dirichlet_loss / nwindows
+            avg_pred_loss = total_pred_loss / nwindows
+            avg_diversity_loss = total_diversity_loss / nwindows
+            self.logger.info("epoch %d/%d:" % (epoch, nepochs))
+            self.logger.info("Total loss: %.4f" % total_loss)
+            self.logger.info("SGNS loss: %.4f" % avg_sgns_loss)
+            self.logger.info("Dirichlet loss: %.4f" % avg_dirichlet_loss)
+            self.logger.info("Prediction loss: %.4f" % avg_pred_loss)
+            self.logger.info("Diversity loss: %.4f" % avg_diversity_loss)
+            concepts = self.get_concept_words(concept_dist=concept_dist)
+            with open(os.path.join(self.concept_dir, "epoch%d.txt" % epoch), "w") as concept_file:
+                for i, concept_words in enumerate(concepts):
+                    self.logger.info('concept %d: %s' % (i + 1, ' '.join(concept_words)))
+                    concept_file.write('concept %d: %s\n' % (i + 1, ' '.join(concept_words)))
+            metrics = (total_loss, avg_sgns_loss, avg_dirichlet_loss, avg_pred_loss,
+                        avg_diversity_loss, train_auc, test_auc)
+            train_metrics_file.write("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n" % metrics)
+            train_metrics_file.flush()
+            results.append(metrics)
+            if (epoch + 1) % save_epochs == 0: #每隔save_epochs存檔一次模型的state_dict
+                torch.save(self.state_dict(), os.path.join(self.model_dir, "epoch%d.pytorch" % epoch))
+                with torch.no_grad():
+                    doc_concept_probs = self.get_train_doc_concept_probs()
+                    np.save(os.path.join(self.model_dir, "epoch%d_train_doc_concept_probs.npy" % epoch),
+                            doc_concept_probs.cpu().detach().numpy())
+
+        torch.save(self.state_dict(), os.path.join(self.model_dir, "epoch%d.pytorch" % (nepochs - 1))) #儲存最終訓練完成的模型
+        return np.array(results)
+        """
+        回傳一個numpy陣列，包含
+        total loss
+        avg_sgns_loss
+        avg_dirichlet_loss
+        avg_predict_loss
+        avg_diversity_loss
+        train_auc
+        test_auc
+        """
+
+    def calculate_auc(self, split, X, y, expvars): #根據模型種類計算AUC或MSE
+        """
+        split : 指示dataset是train或test
+        x : 特徵矩陣(bag-of-words或其他表示)
+        y : 標籤(真實值)
+        expvars : 額外的變數(在predict_proba中使用)
+        """
+        y_pred = self.predict_proba(X, expvars).cpu().detach().numpy()
+        """
+        self.predict_proba(X, expvars)：模型對輸入 X 進行推理，返回預測機率。
+        .cpu().detach().numpy()：將 PyTorch tensor 轉換成 NumPy 陣列，因為 roc_auc_score 需要 NumPy 格式的輸入。
+        """
+        if self.is_binary:
+            auc = roc_auc_score(y, y_pred) #計算AUC
+            self.logger.info("%s AUC: %.4f" % (split, auc)) #紀錄AUC
+            return auc
+        elif self.is_multiclass:
+            y = np.asarray(y).astype(int) #將 y 轉換為 NumPy 陣列並確保是整數類型。
+        
+            num_classes = len(np.unique(y)) #統計有多少個不同的類別。
+            
+            if num_classes > 1:  
                 
-            f.write(swiper)
-        
+                y_pred_normalized = y_pred / y_pred.sum(axis=1, keepdims=True) #使 y_pred 機率總和為 1，確保是正規化的機率分佈。
+                auc = roc_auc_score(y, y_pred_normalized, multi_class='ovr') #計算「一對其餘 (OvR, One-vs-Rest)」的 AUC。
+                self.logger.info("%s AUC (OvR): %.4f" % (split, auc))
+                return auc
+            else:
+                #in case only one class is present
+                self.logger.warning("Only one class present in true labels. ROC AUC score is not defined in that case.")
+                return None  
+        else:
+            mse = mean_squared_error(y, y_pred)
+            # mae = mean_absolute_error(y, y_pred)
+            # r2 = r2_score(y, y_pred)
+            self.logger.info("%s MSE: %.4f" % (split, mse))
+            return mse
+            
 
-# TODO: add filtering such as pos and tf
-def get_concept_words(self, top_k=10, concept_dist='dot'): #獲取每個概念（concept）最相關的詞彙，類似於主題建模中每個主題的關鍵詞提取。
-    """
-       top_k：控制每個概念返回的前 k 個最相關的詞，預設為 10。
-       concept_dist：選擇計算概念與詞語之間距離的方式：
-          預設為 'dot'（點積）。
-          其他選擇是 cdist() 提供的距離度量（如 'cosine', 'euclidean' 等）。
-    """
-    concept_embed = self.embedding_t.data.cpu().numpy() #concept_embed.shape = (n_concepts, embed_dim)：每個概念的嵌入向量。
-    word_embed = self.embedding_i.weight.data.cpu().numpy() #word_embed.shape = (vocab_size, embed_dim)：每個詞的嵌入向量。
-    #這兩個變數表示概念與詞彙在同一空間的嵌入向量，我們接下來要計算它們的相似度。
+    def predict_proba(self, count_matrix, expvars=None): #對給定的 count_matrix（詞頻矩陣或 bag-of-words 表示）進行推理，並返回預測機率（probability）。
+        """
+        count_matrix: 文檔的詞頻矩陣（Bag-of-Words 或類似的特徵表示）。
+        expvars: 額外的變數（可能是額外的輔助特徵，如元數據、外部變量等）。
+        """
+        with torch.no_grad(): #關閉梯度計算，提高效率並節省記憶體
+            batch_size = count_matrix.size(0) #取得批次大小，接著計算文件概念權重(doc_concept_weights)
+            if self.inductive:
+                doc_concept_weights = self.doc_concept_network(count_matrix)
+            else:
+                doc_concept_weights = self.doc_concept_weights.weight.data
+            doc_concept_probs = F.softmax(doc_concept_weights, dim=1)  # convert to probabilities
+            ones = torch.ones((batch_size, 1)).to(self.device)
+            doc_concept_probs = torch.cat((ones, doc_concept_probs), dim=1)
+            """
+            加入一個恆等概念 (bias term)
+            為什麼要加 ones?
+                這可能是為了表示一個固定的 偏置項 (bias term)，類似於線性模型中的截距項 (intercept)。
+                torch.cat((ones, doc_concept_probs), dim=1)：將 ones 附加到概念機率矩陣的第一列。
+            """
 
-    if concept_dist == 'dot':
-        dist = -np.matmul(concept_embed, np.transpose(word_embed, (1, 0))) #點積越大，表示詞與概念越相似。加上 - 之後，相似詞的數值變小，這樣排序時能獲取最相似的詞（最小值）。
-    else:
-        dist = cdist(concept_embed, word_embed, metric=concept_dist) #cdist 來自 scipy.spatial.distance，可以計算各種距離。dist.shape = (n_concepts, vocab_size)，每個概念對所有詞的距離。
-    nearest_word_idxs = np.argsort(dist, axis=1)[:, :top_k]  # indices of words with min cosine distance 找到最相似的 top_k 個詞
-    """
-       np.argsort()：沿著詞的維度排序，返回索引值：
-          dist.shape = (n_concepts, vocab_size)
-          nearest_word_idxs.shape = (n_concepts, top_k)
-          nearest_word_idxs[j, :] 表示 第 j 個概念最相關的 top_k 個詞的索引。
-    """
-    concepts = []
-    for j in range(self.nconcepts):
-        nearest_words = [self.vocab[i] for i in nearest_word_idxs[j, :]]
-        concepts.append(nearest_words)
-    """
-       遍歷 nconcepts 個概念，找到對應的詞彙：
-          self.vocab[i]：從索引 i 對應到詞彙表中的具體詞。
-          concepts[j]：第 j 個概念的 top_k 關鍵詞。
-        concepts 是一個 list[list[str]]：concepts[0] 是 第 1 個概念的關鍵詞列表。
-    """
-    return concepts
+            if expvars is not None: #如果有額外變數 (expvars)，將其拼接
+                doc_concept_probs = torch.cat((doc_concept_probs, expvars), dim=1)
+
+            pred_weight = torch.matmul(doc_concept_probs, self.theta) #計算預測加權權重 (pred_weight)，代表預測的未標準化分數（logits）。
+            pred_proba = pred_weight.sigmoid() #透過 Sigmoid 轉換為機率
+        return pred_proba
+
+    def get_train_doc_concept_probs(self): #計算訓練數據的文檔概念機率，即將訓練集中每篇文檔的特徵轉換為概念的機率分佈。
+        if self.inductive:
+            doc_concept_weights = self.doc_concept_network(self.bow_train)
+        else:
+            doc_concept_weights = self.doc_concept_weights.weight.data
+        return F.softmax(doc_concept_weights, dim=1)  # convert to probabilities
+
+    def visualize(self): #可視化概念-詞彙分佈，通過 pyLDAvis 和 詞雲 (WordCloud) 來幫助我們理解每個概念（或話題）的關鍵詞分佈。
+        with torch.no_grad():
+            doc_concept_probs = self.get_train_doc_concept_probs()
+            """
+            self.bow_train.shape = (num_documents, vocab_size)：這是訓練集中每篇文檔的詞頻向量。
+            這一步通過矩陣乘法：concept_word_counts = doc_concept_probs^T × bow_train
+            這樣，每個概念的詞頻是所有屬於該概念的文檔的詞頻加總。
+            將詞頻轉換為機率分佈：對於每個概念，將詞頻除以該概念的詞頻總和，得到每個詞的相對出現機率。
+            如果某個概念沒有任何詞（全 0），則會產生 NaN（因為除 0）。
+            這裡使用 1/vocab_size 填補這些 NaN，確保每個詞至少有一點機率。
+            """
+            # [n_concepts, vocab_size] weighted word counts of each concept 計算每個概念的詞彙機率(concept_word_sists)
+            concept_word_counts = torch.matmul(doc_concept_probs.transpose(0, 1), self.bow_train)
+            # normalize word counts to word distribution of each concept
+            concept_word_dists = concept_word_counts / concept_word_counts.sum(1, True)
+            # fill NaN with 1/vocab_size in case a concept has all zero word distribution
+            concept_word_dists[concept_word_dists != concept_word_dists] = 1.0 / concept_word_dists.shape[1]
+            vis_data = pyLDAvis.prepare(topic_term_dists=concept_word_dists.data.cpu().numpy(),
+                                        doc_topic_dists=doc_concept_probs.data.cpu().numpy(),
+                                        doc_lengths=self.doc_lens, vocab=self.vocab, term_frequency=self.word_counts)
+            """
+            pyLDAvis.prepare 參數解析
+                topic_term_dists：概念的詞分佈（形狀 (num_concepts, vocab_size)）。
+                doc_topic_dists：文檔的概念機率分佈（形狀 (num_documents, num_concepts)）。
+                doc_lengths：每篇文檔的詞數（形狀 (num_documents,)）。
+                vocab：詞彙表（形狀 (vocab_size,)）。
+                term_frequency：每個詞的整體頻率。
+            """
+            
+            html_path = os.path.join(self.out_dir, "visualization.html")
+            pyLDAvis.save_html(vis_data, html_path)
+            # pyLDAvis.save_html(vis_data, os.path.join(self.out_dir, "visualization.html"))
+            """vis_data 是 pyLDAvis 的可視化數據，接著將其保存為 HTML"""
+
+            for i in range(len(concept_word_dists)): #生成詞雲 (WordCloud)
+                concept_word_weights = dict(zip(self.vocab, concept_word_dists[i].cpu().numpy()))
+                wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(concept_word_weights)
+                plt.figure(figsize=(10, 5))
+                plt.imshow(wordcloud, interpolation='bilinear')
+                plt.title(f'Concept {i+1} Word Cloud')
+                plt.axis('off')
+                plt.savefig(os.path.join(self.out_dir, f'concept_{i+1}_wordcloud.png'))
+
+            with open(html_path, "a+") as f: # 整合 swiper.html（可能是前端視覺化工具）
+
+                current_directory = os.getcwd()
+                print("Current directory:", current_directory)
+                swiper_vis_path = current_directory + '/swiper.html'
+                with open(swiper_vis_path, 'r') as swipertext:
+                    swiper = swipertext.read() 
+                    
+                f.write(swiper)
+            
+
+    # TODO: add filtering such as pos and tf
+    def get_concept_words(self, top_k=10, concept_dist='dot'): #獲取每個概念（concept）最相關的詞彙，類似於主題建模中每個主題的關鍵詞提取。
+        """
+        top_k：控制每個概念返回的前 k 個最相關的詞，預設為 10。
+        concept_dist：選擇計算概念與詞語之間距離的方式：
+            預設為 'dot'（點積）。
+            其他選擇是 cdist() 提供的距離度量（如 'cosine', 'euclidean' 等）。
+        """
+        concept_embed = self.embedding_t.data.cpu().numpy() #concept_embed.shape = (n_concepts, embed_dim)：每個概念的嵌入向量。
+        word_embed = self.embedding_i.weight.data.cpu().numpy() #word_embed.shape = (vocab_size, embed_dim)：每個詞的嵌入向量。
+        #這兩個變數表示概念與詞彙在同一空間的嵌入向量，我們接下來要計算它們的相似度。
+
+        if concept_dist == 'dot':
+            dist = -np.matmul(concept_embed, np.transpose(word_embed, (1, 0))) #點積越大，表示詞與概念越相似。加上 - 之後，相似詞的數值變小，這樣排序時能獲取最相似的詞（最小值）。
+        else:
+            dist = cdist(concept_embed, word_embed, metric=concept_dist) #cdist 來自 scipy.spatial.distance，可以計算各種距離。dist.shape = (n_concepts, vocab_size)，每個概念對所有詞的距離。
+        nearest_word_idxs = np.argsort(dist, axis=1)[:, :top_k]  # indices of words with min cosine distance 找到最相似的 top_k 個詞
+        """
+        np.argsort()：沿著詞的維度排序，返回索引值：
+            dist.shape = (n_concepts, vocab_size)
+            nearest_word_idxs.shape = (n_concepts, top_k)
+            nearest_word_idxs[j, :] 表示 第 j 個概念最相關的 top_k 個詞的索引。
+        """
+        concepts = []
+        for j in range(self.nconcepts):
+            nearest_words = [self.vocab[i] for i in nearest_word_idxs[j, :]]
+            concepts.append(nearest_words)
+        """
+        遍歷 nconcepts 個概念，找到對應的詞彙：
+            self.vocab[i]：從索引 i 對應到詞彙表中的具體詞。
+            concepts[j]：第 j 個概念的 top_k 關鍵詞。
+            concepts 是一個 list[list[str]]：concepts[0] 是 第 1 個概念的關鍵詞列表。
+        """
+        return concepts
 
 
 class DocWindowsDataset(torch.utils.data.Dataset):
