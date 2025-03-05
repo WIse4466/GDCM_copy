@@ -9,25 +9,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-
-#######################
-# 1. 讀取並處理文本文件
-#######################
-
-# 假設 alt.atheism.txt 與此腳本在同一目錄下
-#file_path = "alt.atheism.txt"
-#with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-#    text = f.read()
-
-#使用sklearn的20newsgroups資料集
 newsgroups = fetch_20newsgroups(subset='all', remove=('headers', 'footers', 'quotes'))
 docs = newsgroups.data
-
-# 根據雙換行分割成多個段落（作為獨立文檔）
-#docs = text.split("\n\n")
-#docs = [doc.strip() for doc in docs if doc.strip() != ""]
-
-# 定義預處理函數：轉小寫、去除非字母字符、分詞
 def preprocess(doc):
     doc = doc.lower()
     doc = re.sub(r"[^a-z\s]", "", doc)
@@ -35,141 +18,124 @@ def preprocess(doc):
     return tokens
 
 docs_tokens = [preprocess(doc) for doc in docs]
-
-###################################
-# 2. 建立詞彙表並生成詞袋表示
-###################################
-
-# 建立詞彙：這裡簡單採用所有出現過的單詞
+# 建立詞彙表
 all_tokens = [token for doc in docs_tokens for token in doc]
 vocab_counter = Counter(all_tokens)
 vocab = list(vocab_counter.keys())
 vocab_size = len(vocab)
-print(f"建立詞彙表，大小 = {vocab_size}")
 
-# 建立單詞到索引的映射
+# 建立 word2idx 和 idx2word 對應
 word2idx = {word: i for i, word in enumerate(vocab)}
+idx2word = {i: word for word, i in word2idx.items()}
 
-# 將每個文檔轉換為詞袋向量（每個向量大小為 vocab_size）
-bow_matrix = []
-for tokens in docs_tokens:
-    vec = np.zeros(vocab_size, dtype=np.float32)
-    for token in tokens:
-        idx = word2idx[token]
-        vec[idx] += 1
-    bow_matrix.append(vec)
-bow_matrix = np.array(bow_matrix)
-num_docs = bow_matrix.shape[0]
-print(f"文檔數量 = {num_docs}")
+print(f"詞彙表大小: {vocab_size}")
 
-###################################
-# 3. 構造 DataLoader
-###################################
+import random
 
-# 將 numpy 數據轉換為 torch tensor
-bow_tensor = torch.tensor(bow_matrix, dtype=torch.float32)
-# 使用 TensorDataset 和 DataLoader（這裡不使用標籤，僅用詞袋向量）
-dataset = TensorDataset(bow_tensor)
-batch_size = 16
-data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-###################################
-# 4. 定義基於VAE的主題模型
-###################################
-
-class VAE_TopicModel(nn.Module):
-    def __init__(self, vocab_size, n_topics, hidden_size=100):
-        """
-        :param vocab_size: 詞彙表大小
-        :param n_topics: 主題數量（潛在變量維度）
-        :param hidden_size: 隱藏層大小
-        """
-        super(VAE_TopicModel, self).__init__()
-        self.vocab_size = vocab_size
-        self.n_topics = n_topics
-        self.hidden_size = hidden_size
-        
-        # 編碼器部分
-        self.fc1 = nn.Linear(vocab_size, hidden_size)
-        self.fc_mu = nn.Linear(hidden_size, n_topics)
-        self.fc_logvar = nn.Linear(hidden_size, n_topics)
-        
-        # 解碼器部分：將潛在主題轉換回詞袋分布
-        self.fc_decoder = nn.Linear(n_topics, vocab_size)
-        
-    def encode(self, x):
-        h = F.relu(self.fc1(x))
-        mu = self.fc_mu(h)
-        logvar = self.fc_logvar(h)
-        return mu, logvar
+def generate_skipgram_pairs(docs_tokens, window_size=2, num_neg_samples=5):
+    positive_pairs = []
+    negative_pairs = []
     
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+    for tokens in docs_tokens:
+        indices = [word2idx[word] for word in tokens if word in word2idx]
+        
+        for i, target in enumerate(indices):
+            window_start = max(i - window_size, 0)
+            window_end = min(i + window_size + 1, len(indices))
+            
+            # 取得 context 單詞
+            context_words = indices[window_start:i] + indices[i+1:window_end]
+            for ctx in context_words:
+                positive_pairs.append((target, ctx))
+                
+                # 生成負樣本
+                for _ in range(num_neg_samples):
+                    neg_word = random.randint(0, vocab_size - 1)
+                    negative_pairs.append((target, neg_word))
     
-    def decode(self, z):
-        logits = self.fc_decoder(z)
-        # 使用 softmax 將 logits 轉換成概率分布（每個文檔中各詞的出現概率）
-        return F.softmax(logits, dim=1)
-    
-    def forward(self, x):
-        # x 的形狀為 [batch_size, vocab_size]（詞袋向量）
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
-        recon = self.decode(z)
-        return recon, mu, logvar
+    return positive_pairs, negative_pairs
 
-def loss_function(recon, x, mu, logvar):
+# 產生 skip-gram 訓練數據
+positive_pairs, negative_pairs = generate_skipgram_pairs(docs_tokens, window_size=2, num_neg_samples=5)
+print(f"正樣本數量: {len(positive_pairs)}, 負樣本數量: {len(negative_pairs)}")
+
+# 轉換成 PyTorch 張量
+positive_pairs_tensor = torch.tensor(positive_pairs, dtype=torch.long)
+negative_pairs_tensor = torch.tensor(negative_pairs, dtype=torch.long)
+
+# 使用 TensorDataset 和 DataLoader
+batch_size = 1024
+# 正樣本 DataLoader
+positive_dataset = TensorDataset(positive_pairs_tensor)
+positive_data_loader = DataLoader(positive_dataset, batch_size=batch_size, shuffle=True)
+
+# 負樣本 DataLoader
+negative_dataset = TensorDataset(negative_pairs_tensor)
+negative_data_loader = DataLoader(negative_dataset, batch_size=batch_size, shuffle=True)
+
+class SkipGramModel(nn.Module):
+    def __init__(self, vocab_size, embedding_dim):
+        super(SkipGramModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+    
+    def forward(self, center_word, context_word):
+        v_pvt = self.embedding(center_word)  # 主要單詞向量
+        v_ctx = self.embedding(context_word)  # 背景單詞向量
+        return torch.sum(v_pvt * v_ctx, dim=1)  # 內積計算相似度
+
+def negative_sampling_loss(pos_scores, neg_scores):
     """
-    定義損失：重構損失（交叉熵形式）+ KL 散度
+    pos_scores: 正樣本的點積結果
+    neg_scores: 負樣本的點積結果
     """
-    # 重構損失：計算原始詞袋與重構分布之間的交叉熵（對每個文檔求和）
-    BCE = -torch.sum(x * torch.log(recon + 1e-10), dim=1)
-    # KL 散度：讓潛在變量接近標準正態分布
-    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-    return torch.mean(BCE + KLD)
+    pos_loss = -F.logsigmoid(pos_scores).mean()  # 第一項
+    neg_loss = -F.logsigmoid(-neg_scores).mean()  # 第二項
+    return pos_loss + neg_loss
 
-###################################
-# 5. 訓練模型
-###################################
+# 設定超參數
+embedding_dim = 100
+learning_rate = 0.01
+num_epochs = 5
 
-def train_topic_model(model, data_loader, epochs=50, lr=1e-3, device="cpu"):
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for batch in data_loader:
-            # TensorDataset 返回的是一個 tuple，取出第一個元素即詞袋向量
-            x = batch[0].to(device)
-            optimizer.zero_grad()
-            recon, mu, logvar = model(x)
-            loss = loss_function(recon, x, mu, logvar)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        avg_loss = total_loss / len(data_loader)
-        print(f"Epoch {epoch+1}, Loss: {avg_loss:.4f}")
-
-# 設置設備
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
+model = SkipGramModel(vocab_size, embedding_dim).to(device)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-# 設定主題模型參數：這裡設定主題數量為 20
-n_topics = 20
-model = VAE_TopicModel(vocab_size, n_topics, hidden_size=100).to(device)
+# 訓練迴圈
+for epoch in range(num_epochs):
+    total_loss = 0.0
 
-# 開始訓練（訓練輪數可根據需要調整）
-train_topic_model(model, data_loader, epochs=50, lr=1e-3, device=device)
+    # 使用 zip() 同時迭代兩個 DataLoader
+    for (pos_batch,), (neg_batch,) in zip(positive_data_loader, negative_data_loader):
+        pos_batch, neg_batch = pos_batch.to(device), neg_batch.to(device)
+        center_word_pos, context_word_pos = pos_batch[:, 0], pos_batch[:, 1]
+        center_word_neg, context_word_neg = neg_batch[:, 0], neg_batch[:, 1]
 
-###################################
-# 6. 查看每個主題的重要詞語（透過解碼器權重）
-###################################
-# 取出解碼器的權重，權重 shape 為 [n_topics, vocab_size]
-phi_logits = model.fc_decoder.weight.data.cpu().numpy()
-# 對每個主題取出排名前 10 的詞語
-top_n = 10
-for topic_idx, topic_weights in enumerate(phi_logits):
-    top_word_indices = topic_weights.argsort()[-top_n:][::-1]
-    top_words = [vocab[i] for i in top_word_indices]
-    print(f"Topic {topic_idx+1}: {' '.join(top_words)}")
+        # 正樣本分數
+        pos_scores = model(center_word_pos, context_word_pos)
+
+        # 負樣本分數
+        neg_scores = model(center_word_neg, context_word_neg)
+
+        # 計算損失
+        loss = negative_sampling_loss(pos_scores, neg_scores)
+
+        # 反向傳播與優化
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss:.4f}")
+
+print("訓練完成！")
+
+# 取得單詞的嵌入向量
+word_embeddings = model.embedding.weight.data.cpu().numpy()
+
+# 隨機選 10 個單詞，顯示其對應的嵌入向量
+sample_words = random.sample(vocab, 10)
+for word in sample_words:
+    idx = word2idx[word]
+    print(f"{word}: {word_embeddings[idx][:5]} ...")  # 顯示前 5 個數值
