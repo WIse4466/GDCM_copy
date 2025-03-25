@@ -237,7 +237,7 @@ class GuidedDiverseConceptMiner(nn.Module):
         self.train_dataset = DocWindowsDataset(doc_windows) #把有關上下文的資料丟入，建立一個DocWindowsDataset的物件
 
         if doc_lens is None: #doc_lens : 每個文件的長度(詞彙數量)，形狀為(n_train_docs,)。
-            self.docweights = np.ones(ndocs, dtype=np.float) #ndocs : 文件的總數，即bow_train.shape[0]。 self.docweights : 儲存計算出的文件權重，後續可能用於調整損失函數或模型訓練權重。
+            self.docweights = np.ones(ndocs, dtype=np.float64) #ndocs : 文件的總數，即bow_train.shape[0]。 self.docweights : 儲存計算出的文件權重，後續可能用於調整損失函數或模型訓練權重。
         else:
             self.docweights = 1.0 / np.log(doc_lens)
             self.doc_lens = doc_lens
@@ -367,7 +367,8 @@ class GuidedDiverseConceptMiner(nn.Module):
         self.theta.requires_grad = True
 
         # weights for negative sampling
-        wf = np.power(word_counts, consts.BETA)  # exponent from word2vec paper
+        wf = np.array([word_counts[word] for word in vocab], dtype=np.float64)
+        wf = np.power(wf, consts.BETA)  # exponent from word2vec paper
         self.word_counts = word_counts
         wf = wf / np.sum(wf)  # convert to probabilities
         self.weights = torch.tensor(wf, dtype=torch.float32, requires_grad=False, device=device)
@@ -696,7 +697,7 @@ class GuidedDiverseConceptMiner(nn.Module):
             self.logger.info("Prediction loss: %.4f" % avg_pred_loss)
             self.logger.info("Diversity loss: %.4f" % avg_diversity_loss)
             concepts = self.get_concept_words(concept_dist=concept_dist)
-            with open(os.path.join(self.concept_dir, "epoch%d.txt" % epoch), "w") as concept_file:
+            with open(os.path.join(self.concept_dir, "epoch%d.txt" % epoch), "w", encoding="utf-8") as concept_file:
                 for i, concept_words in enumerate(concepts):
                     self.logger.info('concept %d: %s' % (i + 1, ' '.join(concept_words)))
                     concept_file.write('concept %d: %s\n' % (i + 1, ' '.join(concept_words)))
@@ -861,6 +862,8 @@ class GuidedDiverseConceptMiner(nn.Module):
             預設為 'dot'（點積）。
             其他選擇是 cdist() 提供的距離度量（如 'cosine', 'euclidean' 等）。
         """
+        id2word = {idx: word for word, idx in self.vocab.items()}
+
         concept_embed = self.embedding_t.data.cpu().numpy() #concept_embed.shape = (n_concepts, embed_dim)：每個概念的嵌入向量。
         word_embed = self.embedding_i.weight.data.cpu().numpy() #word_embed.shape = (vocab_size, embed_dim)：每個詞的嵌入向量。
         #這兩個變數表示概念與詞彙在同一空間的嵌入向量，我們接下來要計算它們的相似度。
@@ -878,7 +881,7 @@ class GuidedDiverseConceptMiner(nn.Module):
         """
         concepts = []
         for j in range(self.nconcepts):
-            nearest_words = [self.vocab[i] for i in nearest_word_idxs[j, :]]
+            nearest_words = [id2word[i] for i in nearest_word_idxs[j, :]]
             concepts.append(nearest_words)
         """
         遍歷 nconcepts 個概念，找到對應的詞彙：
