@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import os
 from sklearn.datasets import fetch_20newsgroups
+from sklearn.preprocessing import LabelEncoder
 from nltk.tokenize import word_tokenize
 import nltk
 from nltk.corpus import stopwords
@@ -11,7 +12,8 @@ from gdcm import GuidedDiverseConceptMiner
 #nltk.download("punkt")
 #nltk.download("stopwords")
 
-def preprocess_pipeline(raw_texts, labels, max_vocab_size=20000, window_size=5, pad_token_idx=0):
+def preprocess_pipeline(raw_texts, labels, max_vocab_size=20000, window_size=5, pad_token_idx=0, label_encoder=None
+                        , vocab=None, id2word=None):
     #full preprocessing pipeline：tokenize → build vocab → build BoW → build window
 
     assert len(raw_texts) == len(labels)
@@ -38,12 +40,23 @@ def preprocess_pipeline(raw_texts, labels, max_vocab_size=20000, window_size=5, 
     print("Stopwrod done")
 
     #Build Vocab
-    word_counts = Counter(word for doc in cleaned_texts for word in doc)
-    most_common = word_counts.most_common(max_vocab_size)
-    vocab = {word: idx for idx, (word, _) in enumerate(most_common)}
-    id2word = {idx: word for word, idx in vocab.items()}
+    if vocab is None:
+        word_counts = Counter(word for doc in cleaned_texts for word in doc)
+        most_common = word_counts.most_common(max_vocab_size)
+        vocab = {word: idx for idx, (word, _) in enumerate(most_common)}
+        id2word = {idx: word for word, idx in vocab.items()}
+        print("Vocab built from scratch")
+    else:
+        word_counts = Counter()  # 空的，也OK
+        print("Using existing vocab")
 
     print("Vocab done")
+
+    #Label decoding
+    if label_encoder is not None:
+        labels_str = label_encoder.inverse_transform(labels)
+    else:
+        labels_str = labels
 
     #Build Bag of Words
     X_Bow = np.zeros((len(cleaned_texts), len(vocab)), dtype=np.int64)
@@ -71,7 +84,7 @@ def preprocess_pipeline(raw_texts, labels, max_vocab_size=20000, window_size=5, 
                 doc_windows.append([doc_idx, pivot] + context + [labels[doc_idx]])
     print("window done")
     
-    return tokenized_texts, vocab, id2word, word_counts, X_Bow, np.array(doc_windows, dtype=np.int64), np.array(labels, dtype=np.int64)
+    return tokenized_texts, vocab, id2word, word_counts, X_Bow, np.array(doc_windows, dtype=np.int64), np.array(labels), np.array(labels_str)
 
 if __name__ == "__main__":
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -86,21 +99,34 @@ if __name__ == "__main__":
     raw_texts_train = newsgroups_train.data
     raw_texts_test = newsgroups_test.data
 
-    tokenized_texts_train, vocab_train, id2word_train, word_counts_train, X_train, doc_windows_train, y_train = preprocess_pipeline(
+    # 將數值 label 轉回文字 label
+    label_names = newsgroups_train.target_names  # e.g., ['alt.atheism', 'comp.graphics', ..., 'talk.religion.misc']
+    labels_str_train = [label_names[i] for i in newsgroups_train.target]
+    labels_str_test = [label_names[i] for i in newsgroups_test.target]
+
+    # 現在才用 LabelEncoder 編碼（保證對應到文字）
+    le = LabelEncoder()
+    labels_encoded_train = le.fit_transform(labels_str_train)
+    labels_encoded_test = le.transform(labels_str_test)  # 注意：測試集只能 transform，不能 fit！
+    
+    tokenized_texts_train, vocab, id2word, word_counts, X_train, doc_windows_train, y_train_int, y_train_str = preprocess_pipeline(
         raw_texts=newsgroups_train.data,
-        labels=newsgroups_train.target,
+        labels=labels_encoded_train,
         max_vocab_size=20000,
-        window_size=5
+        window_size=5,
+        label_encoder=le
     )
 
-    tokenized_texts_test, vocab_test, id2word_test, word_counts_test, X_test, doc_windows_test, y_test = preprocess_pipeline(
-        raw_texts=newsgroups_train.data,
-        labels=newsgroups_train.target,
-        max_vocab_size=20000,
-        window_size=5
+    tokenized_texts_test, _, _, _, X_test, doc_windows_test, y_test_int, y_test_str = preprocess_pipeline(
+        raw_texts=newsgroups_test.data,
+        labels=labels_encoded_test,
+        window_size=5,
+        label_encoder=le,
+        vocab=vocab,
+        id2word=id2word
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    '''device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     X_train_tensor = torch.tensor(X_train, dtype=torch.long, device=device)
     X_test_tensor = torch.tensor(X_test, dtype=torch.long, device=device)
     y_train_tensor = torch.tensor(y_train, dtype=torch.long, device=device)
@@ -109,15 +135,18 @@ if __name__ == "__main__":
     print(X_train_tensor.shape)
     print(X_test_tensor.shape)
     print(y_train_tensor.shape)
-    print(y_test_tensor.shape)
+    print(y_test_tensor.shape)'''
 
     gdcm = GuidedDiverseConceptMiner(
         out_dir=output_dir, embed_dim=300, nnegs=15, nconcepts=25, lam=100.0, rho=100.0, eta=1.0,
         doc_concept_probs=None, word_vectors=None, theta=None, gpu=None,
         inductive=True, inductive_dropout=0.01, hidden_size=100, num_layers=1,
-        bow_train=X_train_tensor.cpu().numpy(), y_train=y_train_tensor.cpu().numpy(), bow_test=X_test_tensor.cpu().numpy(), y_test=y_test_tensor.cpu().numpy(), 
-        doc_windows=doc_windows_train, vocab=vocab_train,
-        word_counts=word_counts_train, doc_lens=None, expvars_train=None, expvars_test=None, file_log=False, norm=None
+        bow_train=X_train, y_train=y_train_str, bow_test=X_test, y_test=y_test_str, 
+        doc_windows=doc_windows_train, vocab=vocab,
+        word_counts=word_counts, doc_lens=None, expvars_train=None, expvars_test=None, file_log=False, norm=None
     )
+
+    gdcm.y_train = y_train_int
+    gdcm.y_test = y_test_int
 
     gdcm.fit()
